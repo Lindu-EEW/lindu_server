@@ -7,7 +7,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 
 # Konfigurasi MQTT
-MQTT_BROKER = os.getenv("MQTT_BROKER", "test.mosquitto.org")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.68.105")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 TOPIC_STATUS = "lindu/sensor/+/status"
 TOPIC_EVENT  = "lindu/sensor/+/event"
