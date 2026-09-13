@@ -257,10 +257,14 @@ def on_message(client, userdata, msg):
 
             
     # 2. EVENT / TELEMETRI (Ada Getaran dari Node)
-    elif "/event" in msg.topic:
+    elif "/telemetry" in msg.topic:
         node_id = payload.get("node_id")
         pga = payload.get("pga", 0)
         sta_lta = payload.get("sta_lta", 0)
+        
+        # [SYARAT TRIGGER ALERT LOKAL]
+        if pga < 0.12:
+            return # Abaikan noise kecil
         
         # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik)
         save_telemetry(payload)
