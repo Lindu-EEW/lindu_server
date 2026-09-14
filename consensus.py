@@ -16,15 +16,16 @@ TOPIC_EXTERNAL  = "lindu/external/alert"
 TOPIC_ALARM  = "lindu/actuator/cmd/all"
 
 # Konfigurasi Database
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "lindu_admin")
-DB_PASS = os.getenv("DB_PASS", "supersecretpassword")
-DB_NAME = os.getenv("DB_NAME", "lindudb")
+DB_HOST = "grafana_postgres"
+DB_USER = "postgres"
+DB_PASS = "postgres"
+DB_NAME = "lindu_db"
 
 # In-Memory Database (Cache Cepat agar tidak lag saat gempa)
 node_registry = {} 
 trigger_buffer = []
 active_quake = None
+mqtt_client = None
 
 def init_db():
     try:
@@ -365,7 +366,7 @@ def on_message(client, userdata, msg):
                         "telemetry_count": active_quake["telemetry_count"],
                         "desc": f"📡 Pemurnian Episentrum Live! Mengolah data dari {len(active_quake['nodes_pga'])} sensor aktif. Pusat energi terkoreksi menuju titik guncangan maksimum (PGA {abs_max_pga:.2f}G)."
                     }
-                    client.publish(TOPIC_ALARM, json.dumps(update_payload))
+                    mqtt_client.publish(TOPIC_ALARM, json.dumps(update_payload))
                     print(f"[LIVE REFINEMENT] Pusat: {refined_lat:.4f}, {refined_lon:.4f} | Mag: {refined_mag:.1f} | Nodes: {len(active_quake['nodes_pga'])}")
 
 
@@ -381,6 +382,19 @@ import threading
 
 app = Flask(__name__)
 CORS(app)
+
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "status": "online",
+        "service": "Lindu.id Consensus & API Engine",
+        "endpoints": [
+            "/api/history",
+            "/api/nodes",
+            "/api/metrics",
+            "/api/cmd"
+        ]
+    })
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
@@ -446,22 +460,33 @@ def run_consensus_logic():
         # Jika jarak terlalu dekat (misal di ruangan yang sama), anggap valid langsung
         if jarak_km < 0.1:
             print(f"[KONSENSUS] 2 Node di area yang sama bergetar. Validasi Fisika di-bypass.")
-            fire_alarm(client, t1, t2, 0.0, 0.0)
+            fire_alarm(mqtt_client, t1, t2, 0.0, 0.0)
             return
             
-        kecepatan = jarak_km / selisih_waktu if selisih_waktu > 0 else float('inf')
-        
-        # HUKUM FISIKA (P-Wave Velocity Validation)
+        # HUKUM FISIKA & KETERBATASAN WAKTU
         print(f"[*] Mengevaluasi {t1['node_id']} & {t2['node_id']}")
-        print(f"    Jarak: {jarak_km:.2f} km | Δt: {selisih_waktu:.3f}s | Kecepatan: {kecepatan:.2f} km/s")
         
-        # Logika Fisika P-Wave (1.0 km/s - 15.0 km/s)
-        if kecepatan > 1.0 and kecepatan < 15.0:
-            print(f"[+] KONSENSUS TERCAPAI! Jarak {jarak_km:.2f} KM ditempuh dalam {selisih_waktu} detik (Kecepatan {kecepatan:.2f} km/s).")
-            fire_alarm(client, t1, t2, kecepatan, selisih_waktu)
-            return  # Selesai, buffer sudah dikosongkan di fire_alarm
+        is_valid = False
+        if selisih_waktu == 0:
+            # 1. Episentrum berada persis di tengah kedua node (equidistant)
+            # 2. Rambatan terjadi di bawah 1 detik (karena presisi timestamp ESP32 hanya 1 detik)
+            kecepatan = 6.0 # Asumsi kecepatan standar P-Wave
+            is_valid = True
+            print(f"    Jarak: {jarak_km:.2f} km | Δt: 0.000s -> EPISENTRUM EQUIDISTANT / SIMULTAN")
+            print(f"[+] KONSENSUS TERCAPAI! Gelombang tiba bersamaan di kedua sensor.")
         else:
-            print(f"    [-] Validasi pair gagal. Kecepatan {kecepatan:.2f} km/s tidak masuk akal.")
+            kecepatan = jarak_km / selisih_waktu
+            print(f"    Jarak: {jarak_km:.2f} km | Δt: {selisih_waktu:.3f}s | Kecepatan: {kecepatan:.2f} km/s")
+            # Toleransi hingga 25 km/s untuk kompensasi pembulatan detik
+            if kecepatan > 0.5 and kecepatan < 25.0:
+                is_valid = True
+                print(f"[+] KONSENSUS TERCAPAI! Jarak {jarak_km:.2f} KM (Kecepatan {kecepatan:.2f} km/s).")
+            else:
+                print(f"    [-] Validasi pair gagal. Kecepatan {kecepatan:.2f} km/s tidak masuk akal.")
+                
+        if is_valid:
+            fire_alarm(mqtt_client, t1, t2, kecepatan, selisih_waktu)
+            return  # Selesai, buffer sudah dikosongkan di fire_alarm
             
     # Jika sampai di sini, artinya tidak ada pasangan yang valid (semua False Positive). 
     # Mereka akan terus tertahan di buffer sampai expired (60 detik).
@@ -495,7 +520,7 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     dynamic_radius = round(10 ** (0.5 * magnitude - 1.0), 1)
     
     alarm_payload = {
-        "cmd": "ALARM_ON",
+        "cmd": "trigger_siren",
         "level": "CRITICAL",
         "epi_lat": epi_lat,
         "epi_lon": epi_lon,
@@ -516,13 +541,68 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     print(json.dumps(alarm_payload, indent=2))
     print("=======================================================\n")
     
-    client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
+    mqtt_client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
     
     # Simpan ke database (Black Box)
     save_alert(alarm_payload)
     
     # Kosongkan buffer agar tidak spam alarm berkali-kali
     trigger_buffer.clear()
+
+from flask import request
+
+@app.route('/api/cmd', methods=['POST'])
+def send_cmd():
+    try:
+        data = request.json
+        cmd = data.get('cmd')
+        target = data.get('target_node', 'all')
+        
+        if not cmd:
+            return jsonify({"error": "Missing cmd parameter"}), 400
+            
+        payload = {"cmd": cmd, "target_node": target}
+        
+        if mqtt_client:
+            mqtt_mqtt_client.publish(TOPIC_ALARM, json.dumps(payload))
+            return jsonify({"status": "success", "message": f"Command '{cmd}' sent to {target}"})
+        else:
+            return jsonify({"error": "MQTT Client not initialized"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/metrics', methods=['GET'])
+def get_metrics():
+    conn = get_db_connection()
+    if not conn:
+        return jsonify([])
+    try:
+        cur = conn.cursor()
+        # Mengambil data status terakhir untuk setiap node
+        cur.execute("""
+            SELECT DISTINCT ON (node_id) 
+                node_id, time, status, fw_version, ota_status, latency_ms, sensor_ok 
+            FROM sensor_status 
+            ORDER BY node_id, time DESC;
+        """)
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "node_id": r[0],
+                "time": r[1].isoformat() if r[1] else None,
+                "status": r[2],
+                "fw_version": r[3] if r[3] else "UNKNOWN",
+                "ota_status": r[4] if r[4] else "IDLE",
+                "latency_ms": r[5],
+                "sensor_ok": r[6]
+            })
+        return jsonify(result)
+    except Exception as e:
+        print(f"DB Error (Metrics): {e}")
+        return jsonify([])
+    finally:
+        conn.close()
 
 @app.route('/api/nodes', methods=['GET'])
 def get_nodes():
@@ -560,15 +640,15 @@ if __name__ == "__main__":
     init_db()
     
     # Setup MQTT
-    client = mqtt.Client("LinduServer_01")
-    client.on_connect = on_connect
-    client.on_message = on_message
+    mqtt_client = mqtt.Client("LinduServer_01")
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
     
     print("Menyambungkan ke MQTT Broker...")
     try:
-        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
         # Gunakan loop_start() (Background Thread) agar tidak memblokir Flask
-        client.loop_start() 
+        mqtt_client.loop_start() 
     except Exception as e:
         print(f"[!] Gagal terhubung ke MQTT Broker: {e}")
         
