@@ -258,6 +258,24 @@ def on_message(client, userdata, msg):
         return
 
     # 1. UPSERT NODE REGISTRY (Dari Heartbeat / Status)
+    if "/log" in msg.topic:
+        try:
+            node_id = msg.topic.split('/')[2]
+            log_msg = payload.get("message", "Unknown log")
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("INSERT INTO tb_node_logs (node_id, message) VALUES (%s, %s)", (node_id, log_msg))
+                    conn.commit()
+                    cur.execute("DELETE FROM tb_node_logs WHERE ts < NOW() - INTERVAL '3 days'")
+                    conn.commit()
+                finally:
+                    release_db_connection(conn)
+        except Exception as e:
+            print("[LOG ERROR]", e)
+        return
+
     if "/status" in msg.topic:
         # Fallback node_id dari topic jika payload tidak ada
         node_id = payload.get("node_id") or msg.topic.split('/')[2]
