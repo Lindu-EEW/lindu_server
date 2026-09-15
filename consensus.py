@@ -4,6 +4,7 @@ import math
 import os
 import paho.mqtt.client as mqtt
 import psycopg2
+from psycopg2 import pool
 from psycopg2.extras import execute_values
 
 # Konfigurasi MQTT
@@ -106,15 +107,28 @@ def init_db():
         print(f"[DB] {len(node_registry)} Node berhasil di-load dari Database ke RAM.")
         
         cur.close()
-        conn.close()
+        release_db_connection(conn)
     except Exception as e:
         print(f"[!] Gagal konek DB (Abaikan jika testing lokal tanpa DB): {e}")
 
+# Global Connection Pool
+db_pool = None
+try:
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
+except Exception as e:
+    print("Gagal membuat Connection Pool:", e)
+
 def get_db_connection():
-    try:
-        return psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
-    except:
-        return None
+    if db_pool:
+        try:
+            return db_pool.getconn()
+        except:
+            return None
+    return None
+
+def release_db_connection(conn):
+    if db_pool and conn:
+        db_pool.putconn(conn)
 
 def save_telemetry(payload):
     """Simpan setiap pesan telemetri streaming ke database untuk analisis post-event."""
@@ -164,7 +178,7 @@ def save_telemetry(payload):
     except Exception as e:
         print(f"[DB Telemetry Error] {e}")
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 def save_alert(alarm_payload):
     """Simpan riwayat alarm ke database (Black Box)."""
@@ -187,8 +201,8 @@ def save_alert(alarm_payload):
             )
             VALUES ('LOCAL_CONSENSUS', %s, %s, %s, %s, %s, %s, %s, %s);
         """, (
-            alarm_payload["epi_lat"],
-            alarm_payload["epi_lon"],
+            alarm_payload["epicenter_lat"],
+            alarm_payload["epicenter_lon"],
             alarm_payload["radius_km"],
             alarm_payload.get("magnitude", 0),
             alarm_payload.get("measured_velocity_kms", 0),
@@ -201,7 +215,7 @@ def save_alert(alarm_payload):
     except Exception as e:
         print(f"[DB Alert Error] {e}")
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 def haversine_km(lat1, lon1, lat2, lon2):
     """Menghitung jarak bumi dalam kilometer"""
@@ -254,7 +268,7 @@ def on_message(client, userdata, msg):
                 except Exception as e:
                     print(f"[DB Error] {e}")
                 finally:
-                    conn.close()
+                    release_db_connection(conn)
 
             
     # 2. EVENT / TELEMETRI (Ada Getaran dari Node)
@@ -263,9 +277,16 @@ def on_message(client, userdata, msg):
         pga = payload.get("pga", 0)
         sta_lta = payload.get("sta_lta", 0)
         
-        # [SYARAT TRIGGER ALERT LOKAL]
-        if pga < 0.12:
-            return # Abaikan noise kecil
+        freq_hz = payload.get("freq_hz", 0)
+        
+        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
+        # 1. PGA >= 0.12 (Getaran harus cukup keras)
+        # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
+        # 3. Frekuensi <= 20 Hz (Gelombang seismik bumi, bukan ketukan/hentakan sepatu yang tinggi)
+        is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and freq_hz <= 20)
+        
+        if not is_real_quake:
+            return # Buang hentakan kaki, buku jatuh, dan noise kecil
         
         # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik)
         save_telemetry(payload)
@@ -314,7 +335,7 @@ def on_message(client, userdata, msg):
                 except Exception:
                     pass
                 finally:
-                    conn.close()
+                    release_db_connection(conn)
             
             # Refine active earthquake if within 15 seconds window
             global active_quake
@@ -358,8 +379,8 @@ def on_message(client, userdata, msg):
                         "triggering_nodes": t_nodes,
 
                         "cmd": "ALARM_UPDATE",
-                        "epi_lat": refined_lat,
-                        "epi_lon": refined_lon,
+                        "epicenter_lat": refined_lat,
+                        "epicenter_lon": refined_lon,
                         "magnitude": round(refined_mag, 1),
                         "radius_km": round(refined_radius, 1),
                         "shift_km": round(haversine_km(active_quake["initial_lat"], active_quake["initial_lon"], refined_lat, refined_lon), 2),
@@ -430,7 +451,7 @@ def get_history():
         print(f"[API Error] {e}")
         return jsonify([]), 500
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 def run_consensus_logic():
 
@@ -522,8 +543,8 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     alarm_payload = {
         "cmd": "trigger_siren",
         "level": "CRITICAL",
-        "epi_lat": epi_lat,
-        "epi_lon": epi_lon,
+        "epicenter_lat": epi_lat,
+        "epicenter_lon": epi_lon,
         "radius_km": dynamic_radius,
         "confidence": 95,
         "magnitude": magnitude,
@@ -602,7 +623,7 @@ def get_metrics():
         print(f"DB Error (Metrics): {e}")
         return jsonify([])
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 @app.route('/api/nodes', methods=['GET'])
 def get_nodes():
@@ -629,7 +650,7 @@ def get_nodes():
         print(f"[API Nodes Error] {e}")
         return jsonify([]), 500
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 if __name__ == "__main__":
     print("=======================================================")
