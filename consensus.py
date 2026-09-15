@@ -389,6 +389,30 @@ def on_message(client, userdata, msg):
                     }
                     mqtt_client.publish(TOPIC_ALARM, json.dumps(update_payload))
                     print(f"[LIVE REFINEMENT] Pusat: {refined_lat:.4f}, {refined_lon:.4f} | Mag: {refined_mag:.1f} | Nodes: {len(active_quake['nodes_pga'])}")
+                    
+                    # Update database agar Grafana menampilkan magnitudo dan radius yang sudah direvisi
+                    try:
+                        conn_update = get_db_connection()
+                        if conn_update:
+                            cur_update = conn_update.cursor()
+                            cur_update.execute("""
+                                UPDATE tb_system_alerts 
+                                SET magnitude = %s, radius_km = %s, epi_lat = %s, epi_lon = %s, description = %s, triggering_nodes = %s
+                                WHERE time_alert = (SELECT time_alert FROM tb_system_alerts ORDER BY time_alert DESC LIMIT 1)
+                                RETURNING time_alert;
+                            """, (
+                                round(refined_mag, 1), 
+                                round(refined_radius, 1), 
+                                refined_lat, 
+                                refined_lon, 
+                                update_payload["desc"],
+                                json.dumps(t_nodes)
+                            ))
+                            conn_update.commit()
+                    except Exception as e:
+                        print("Gagal update DB Refinement:", e)
+                    finally:
+                        release_db_connection(conn_update)
 
 
 
@@ -513,9 +537,19 @@ def run_consensus_logic():
     # Mereka akan terus tertahan di buffer sampai expired (60 detik).
     print(f"[-] VALIDASI GAGAL! Tidak ada pasangan node yang masuk akal secara fisika dari {len(nodes)} node.")
 
+last_alarm_time = 0  # Cooldown tracker
+
 def fire_alarm(client, t1, t2, velocity, time_diff):
-    global active_quake
+    global active_quake, last_alarm_time
     import time
+    
+    # COOLDOWN 60 DETIK: Jika alarm sudah pernah dipicu < 60 detik lalu,
+    # JANGAN membuat alarm baru. Biarkan Live Refinement yang bekerja.
+    if time.time() - last_alarm_time < 60:
+        print("[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian 60 detik.")
+        return
+    
+    last_alarm_time = time.time()
     active_quake = {
         'start_time': time.time(),
         'initial_lat': (t1["lat"] + t2["lat"]) / 2,
