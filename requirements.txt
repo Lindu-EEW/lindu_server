@@ -2,3 +2,4 @@ paho-mqtt==1.6.1
 psycopg2-binary==2.9.9
 flask==3.0.0
 flask-cors==4.0.0
+psutil==5.9.8

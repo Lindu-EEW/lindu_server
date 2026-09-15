@@ -1,6 +1,9 @@
 import json
 import time
 import math
+import psutil
+import sys
+import os
 import os
 import paho.mqtt.client as mqtt
 import psycopg2
@@ -545,8 +548,8 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     
     # COOLDOWN 60 DETIK: Jika alarm sudah pernah dipicu < 60 detik lalu,
     # JANGAN membuat alarm baru. Biarkan Live Refinement yang bekerja.
-    if time.time() - last_alarm_time < 60:
-        print("[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian 60 detik.")
+    if time.time() - last_alarm_time < 30:
+        print("[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian 30 detik.")
         return
     
     last_alarm_time = time.time()
@@ -560,6 +563,9 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     }
     global trigger_buffer
     import math
+import psutil
+import sys
+import os
     
     # Episentrum diprediksi berada di tengah-tengah kedua node (Midpoint Approximation)
     epi_lat = (t1["lat"] + t2["lat"]) / 2
