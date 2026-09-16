@@ -177,8 +177,8 @@ def save_telemetry(payload):
         ts_value = payload.get("ts", 0)
         if ts_value and ts_value > 1000000:
             cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms)
-                VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status)
+                VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 ts_value,
                 payload.get("node_id"),
@@ -190,12 +190,16 @@ def save_telemetry(payload):
                 payload.get("az", 0),
                 payload.get("lat", 0),
                 payload.get("lon", 0),
-                payload.get("uptime", 0)
+                payload.get("uptime", 0),
+                payload.get("gas_raw", 0),
+                payload.get("gas_alert", False),
+                payload.get("door_status", "UNKNOWN"),
+                payload.get("valve_status", "UNKNOWN")
             ))
         else:
             cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 payload.get("node_id"),
                 payload.get("pga", 0),
@@ -206,7 +210,11 @@ def save_telemetry(payload):
                 payload.get("az", 0),
                 payload.get("lat", 0),
                 payload.get("lon", 0),
-                payload.get("uptime", 0)
+                payload.get("uptime", 0),
+                payload.get("gas_raw", 0),
+                payload.get("gas_alert", False),
+                payload.get("door_status", "UNKNOWN"),
+                payload.get("valve_status", "UNKNOWN")
             ))
         conn.commit()
         cur.close()
@@ -336,13 +344,15 @@ def on_message(client, userdata, msg):
         # 1. PGA >= 0.12 (Getaran harus cukup keras)
         # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
         # 3. Frekuensi <= 20 Hz (Gelombang seismik bumi, bukan ketukan/hentakan sepatu yang tinggi)
+        # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik)
+        # Termasuk data gas, cuaca, dll.
+        save_telemetry(payload)
+
+        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
         is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and freq_hz <= 20)
         
         if not is_real_quake:
             return # Buang hentakan kaki, buku jatuh, dan noise kecil
-        
-        # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik)
-        save_telemetry(payload)
         
         # Gunakan koordinat dari payload jika ada, fallback ke registry
         lat = payload.get("lat")
@@ -441,6 +451,8 @@ def on_message(client, userdata, msg):
                         "desc": f"📡 Pemurnian Episentrum Live! Mengolah data dari {len(active_quake['nodes_pga'])} sensor aktif. Pusat energi terkoreksi menuju titik guncangan maksimum (PGA {abs_max_pga:.2f}G)."
                     }
                     mqtt_client.publish(TOPIC_ALARM, json.dumps(update_payload))
+                    mqtt_client.publish("lindu/actuator/cmd/all", json.dumps(update_payload))
+                    mqtt_client.publish("lindu/sensor/cmd/all", json.dumps(update_payload))
                     print(f"[LIVE REFINEMENT] Pusat: {refined_lat:.4f}, {refined_lon:.4f} | Mag: {refined_mag:.1f} | Nodes: {len(active_quake['nodes_pga'])}")
                     
                     # Update database agar Grafana menampilkan magnitudo dan radius yang sudah direvisi
@@ -649,7 +661,10 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     print(json.dumps(alarm_payload, indent=2))
     print("=======================================================\n")
     
-    mqtt_client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
+    # Broadcast alarm ke semua kemungkinan topik sensor dan aktuator
+    client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
+    client.publish("lindu/actuator/cmd/all", json.dumps(alarm_payload))
+    client.publish("lindu/sensor/cmd/all", json.dumps(alarm_payload))
     
     # Simpan ke database (Black Box)
     save_alert(alarm_payload)
@@ -672,7 +687,11 @@ def send_cmd():
         payload = {"cmd": cmd, "target_node": target}
         
         if mqtt_client:
-            mqtt_mqtt_client.publish(TOPIC_ALARM, json.dumps(payload))
+            # Broadcast ke semua kemungkinan topik agar diterima oleh firmware versi lama maupun baru
+            mqtt_client.publish(TOPIC_ALARM, json.dumps(payload))
+            mqtt_client.publish("lindu/actuator/cmd/all", json.dumps(payload))
+            mqtt_client.publish("lindu/sensor/cmd/all", json.dumps(payload))
+            mqtt_client.publish(f"lindu/sensor/cmd/{target}", json.dumps(payload))
             return jsonify({"status": "success", "message": f"Command '{cmd}' sent to {target}"})
         else:
             return jsonify({"error": "MQTT Client not initialized"}), 500
