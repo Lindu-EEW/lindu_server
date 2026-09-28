@@ -1,10 +1,9 @@
 import json
 import math
-import psutil
-import sys
 import os
 import time
-import math
+import threading
+from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 import psycopg2
 from psycopg2 import pool
@@ -18,12 +17,15 @@ TOPIC_EVENT  = "lindu/sensor/+/event"
 TOPIC_TELEMETRY = "lindu/sensor/+/telemetry"
 TOPIC_EXTERNAL  = "lindu/external/alert"
 TOPIC_ALARM  = "lindu/actuator/cmd/all"
+TOPIC_LOG    = "lindu/sensor/+/log"
+
+server_start_time = time.time()
 
 # Konfigurasi Database
-DB_HOST = "grafana_postgres"
-DB_USER = "postgres"
-DB_PASS = "postgres"
-DB_NAME = "lindu_db"
+DB_HOST = os.getenv("DB_HOST", "grafana_postgres")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASS = os.getenv("DB_PASS", "postgres")
+DB_NAME = os.getenv("DB_NAME", "lindu_db")
 
 # In-Memory Database (Cache Cepat agar tidak lag saat gempa)
 node_registry = {} 
@@ -32,8 +34,17 @@ active_quake = None
 mqtt_client = None
 
 def init_db():
+    conn = None
+    for attempt in range(15):
+        try:
+            conn = psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
+            break
+        except Exception as e:
+            if attempt == 14:
+                print(f"[!] Gagal konek DB (Abaikan jika testing lokal tanpa DB): {e}")
+                return
+            time.sleep(1)
     try:
-        conn = psycopg2.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
         conn.autocommit = True
         cur = conn.cursor()
         
@@ -101,20 +112,50 @@ def init_db():
         cur.execute("ALTER TABLE tb_system_alerts ADD COLUMN IF NOT EXISTS seismic_details JSONB;")
         
         cur.execute("ALTER TABLE tb_nodes ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ DEFAULT NOW();")
-        
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS gas_raw INTEGER;")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS gas_alert BOOLEAN;")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS door_status VARCHAR(20);")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS valve_status VARCHAR(20);")
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_telemetry (
+                time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                node_id VARCHAR(50) NOT NULL,
+                pga DOUBLE PRECISION,
+                rms DOUBLE PRECISION,
+                accel_x DOUBLE PRECISION,
+                accel_y DOUBLE PRECISION,
+                accel_z DOUBLE PRECISION,
+                temperature DOUBLE PRECISION,
+                pressure DOUBLE PRECISION,
+                humidity DOUBLE PRECISION,
+                latency_ms DOUBLE PRECISION,
+                valve_status VARCHAR(20),
+                gas_raw INTEGER,
+                gas_alert BOOLEAN
+            );
+            CREATE TABLE IF NOT EXISTS sensor_status (
+                time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                node_id VARCHAR(50) NOT NULL,
+                status VARCHAR(20),
+                pose VARCHAR(20),
+                tilt_angle DOUBLE PRECISION,
+                latency_ms DOUBLE PRECISION,
+                sensor_ok BOOLEAN,
+                fw_version VARCHAR(50),
+                ota_status VARCHAR(50),
+                motion_detected BOOLEAN
+            );
+            ALTER TABLE sensor_status ADD COLUMN IF NOT EXISTS motion_detected BOOLEAN;
             CREATE TABLE IF NOT EXISTS tb_server_health (
-                ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                cpu_percent REAL,
-                ram_percent REAL,
-                uptime_hours REAL,
+                ts TIMESTAMPTZ DEFAULT NOW(),
+                cpu_percent FLOAT,
+                ram_percent FLOAT,
+                uptime_hours FLOAT,
                 status VARCHAR(32)
             );
-        """)
-        cur.execute("""
             CREATE TABLE IF NOT EXISTS tb_node_logs (
-                ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                node_id VARCHAR(32),
+                ts TIMESTAMPTZ DEFAULT NOW(),
+                node_id VARCHAR(50),
                 message TEXT
             );
         """)
@@ -127,7 +168,7 @@ def init_db():
         print(f"[DB] {len(node_registry)} Node berhasil di-load dari Database ke RAM.")
         
         cur.close()
-        release_db_connection(conn)
+        conn.close()
     except Exception as e:
         print(f"[!] Gagal konek DB (Abaikan jika testing lokal tanpa DB): {e}")
 
@@ -140,6 +181,11 @@ except Exception as e:
 
 def get_db_connection():
     global db_pool
+    if db_pool is None:
+        try:
+            db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, host=DB_HOST, user=DB_USER, password=DB_PASS, dbname=DB_NAME)
+        except Exception:
+            return None
     if db_pool:
         try:
             conn = db_pool.getconn()
@@ -149,11 +195,11 @@ def get_db_connection():
                     cursor.execute("SELECT 1")
             except Exception:
                 print("[DB WARN] Koneksi basi terdeteksi! Membangun ulang Connection Pool...")
-                db_pool.closeall()
-                import psycopg2
-                import psycopg2.pool
-                from config import DB_HOST, DB_NAME, DB_USER, DB_PASS
-                db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
+                try:
+                    db_pool.closeall()
+                except Exception:
+                    pass
+                db_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASS)
                 conn = db_pool.getconn()
             return conn
         except Exception as e:
@@ -164,6 +210,129 @@ def get_db_connection():
 def release_db_connection(conn):
     if db_pool and conn:
         db_pool.putconn(conn)
+
+# Buffer untuk continuous telemetry dan status ingestion (dipakai Grafana & Live Fleet)
+telemetry_ingest_buffer = []
+status_ingest_buffer = []
+logs_ingest_buffer = []
+ingest_lock = threading.Lock()
+
+def db_ingest_writer_thread():
+    last_health_ts = 0
+    while True:
+        time.sleep(1)
+        with ingest_lock:
+            local_telemetry = telemetry_ingest_buffer[:]
+            local_status = status_ingest_buffer[:]
+            local_logs = logs_ingest_buffer[:]
+            telemetry_ingest_buffer.clear()
+            status_ingest_buffer.clear()
+            logs_ingest_buffer.clear()
+
+        if local_telemetry:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    execute_values(cur, """
+                        INSERT INTO sensor_telemetry (time, node_id, pga, rms, accel_x, accel_y, accel_z, temperature, pressure, humidity, latency_ms, valve_status, gas_raw, gas_alert)
+                        VALUES %s
+                    """, local_telemetry)
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[Ingest Telemetry Error] {e}")
+                    conn.rollback()
+                finally:
+                    release_db_connection(conn)
+
+        if local_status:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    execute_values(cur, """
+                        INSERT INTO sensor_status (time, node_id, status, pose, tilt_angle, latency_ms, sensor_ok, fw_version, ota_status, motion_detected)
+                        VALUES %s
+                    """, local_status)
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[Ingest Status Error] {e}")
+                    conn.rollback()
+                finally:
+                    release_db_connection(conn)
+
+        if local_logs:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    execute_values(cur, """
+                        INSERT INTO tb_node_logs (ts, node_id, message)
+                        VALUES %s
+                    """, local_logs)
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[Ingest Logs Error] {e}")
+                    conn.rollback()
+                finally:
+                    release_db_connection(conn)
+
+        # Host Health Periodik setiap 15 detik untuk Grafana Host Health Panel
+        now_ts = time.time()
+        if now_ts - last_health_ts >= 15:
+            last_health_ts = now_ts
+            try:
+                up_sec = now_ts - server_start_time
+                try:
+                    with open("/proc/uptime", "r") as f:
+                        up_sec = float(f.readline().split()[0])
+                except Exception:
+                    pass
+                uptime_hours = round(up_sec / 3600.0, 2)
+
+                ram_pct = 40.0
+                try:
+                    mem = {}
+                    with open("/proc/meminfo", "r") as f:
+                        for l in f:
+                            p = l.split(":")
+                            if len(p) == 2:
+                                mem[p[0].strip()] = float(p[1].strip().split()[0])
+                    t = mem.get("MemTotal", 1.0)
+                    a = mem.get("MemAvailable", mem.get("MemFree", 0.0))
+                    ram_pct = round(((t - a) / t) * 100.0, 1)
+                except Exception:
+                    pass
+
+                cpu_pct = 12.0
+                try:
+                    with open("/proc/loadavg", "r") as f:
+                        load1 = float(f.readline().split()[0])
+                        cpu_pct = round(min(load1 * 25.0, 100.0), 1)
+                except Exception:
+                    pass
+
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("""
+                            INSERT INTO tb_server_health (ts, cpu_percent, ram_percent, uptime_hours)
+                            VALUES (NOW(), %s, %s, %s);
+                        """, (cpu_pct, ram_pct, uptime_hours))
+                        conn.commit()
+                        cur.close()
+                    except Exception as e:
+                        conn.rollback()
+                    finally:
+                        release_db_connection(conn)
+            except Exception as e:
+                print(f"[Host Health Error] {e}")
+
+threading.Thread(target=db_ingest_writer_thread, daemon=True).start()
 
 def save_telemetry(payload):
     """Simpan setiap pesan telemetri streaming ke database untuk analisis post-event."""
@@ -271,36 +440,31 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def on_connect(client, userdata, flags, rc):
     print(f"[SERVER] Terhubung ke MQTT Broker dengan kode {rc}")
-    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0)])
-    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}...")
+    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0), (TOPIC_LOG, 0)])
+    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}...")
 
 def on_message(client, userdata, msg):
     global trigger_buffer
     
+    payload = None
     try:
         payload = json.loads(msg.payload.decode('utf-8'))
-    except json.JSONDecodeError:
-        return
+    except Exception:
+        pass
 
-    # 1. UPSERT NODE REGISTRY (Dari Heartbeat / Status)
+    # 1. LOG MESSAGE (Dari Remote Serial Monitor ESP32)
     if "/log" in msg.topic:
-        try:
-            node_id = msg.topic.split('/')[2]
-            log_msg = payload.get("message", "Unknown log")
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cur = conn.cursor()
-                    cur.execute("INSERT INTO tb_node_logs (node_id, message) VALUES (%s, %s)", (node_id, log_msg))
-                    conn.commit()
-                    cur.execute("DELETE FROM tb_node_logs WHERE ts < NOW() - INTERVAL '3 days'")
-                    conn.commit()
-                finally:
-                    release_db_connection(conn)
-        except Exception as e:
-            print("[LOG ERROR]", e)
+        node_id = (payload.get("node_id") if isinstance(payload, dict) else None) or msg.topic.split('/')[2]
+        message = (payload.get("message") if isinstance(payload, dict) else None) or msg.payload.decode('utf-8', errors='ignore')
+        if node_id and message:
+            with ingest_lock:
+                logs_ingest_buffer.append((datetime.now(timezone.utc), node_id, str(message)))
         return
 
+    if not isinstance(payload, dict):
+        return
+
+    # 2. UPSERT NODE REGISTRY (Dari Heartbeat / Status)
     if "/status" in msg.topic:
         # Fallback node_id dari topic jika payload tidak ada
         node_id = payload.get("node_id") or msg.topic.split('/')[2]
@@ -331,15 +495,51 @@ def on_message(client, userdata, msg):
                 finally:
                     release_db_connection(conn)
 
-            
+        # Ingest ke sensor_status untuk Grafana
+        status = payload.get("status", "online")
+        pose = payload.get("pose", "unknown")
+        tilt_angle = payload.get("tilt_angle", 0.0)
+        sent_ts = payload.get("ts", payload.get("timestamp"))
+        latency_ms = (time.time() - sent_ts) * 1000.0 if sent_ts else payload.get("latency_ms", 0.0)
+        sensor_ok = payload.get("sensor_ok", True)
+        fw_version = payload.get("fw_version", "UNKNOWN")
+        ota_status = payload.get("ota_status", "IDLE")
+        motion_detected = payload.get("motion_detected")
+
+        with ingest_lock:
+            status_ingest_buffer.append((
+                datetime.now(timezone.utc), node_id, status, pose, tilt_angle, latency_ms, sensor_ok, fw_version, ota_status, motion_detected
+            ))
+            logs_ingest_buffer.append((
+                datetime.now(timezone.utc), node_id, f"Heartbeat: status={status}, pose={pose}, tilt={tilt_angle}°, fw={fw_version}"
+            ))
+
     # 2. EVENT / TELEMETRI (Ada Getaran dari Node)
     elif "/telemetry" in msg.topic:
-        node_id = payload.get("node_id")
-        pga = payload.get("pga", 0)
-        sta_lta = payload.get("sta_lta", 0)
-        
+        node_id = payload.get("node_id") or msg.topic.split('/')[2]
+        pga = payload.get("pga", 0.0)
+        sta_lta = payload.get("sta_lta", 0.0)
+        rms = payload.get("rms", sta_lta)
+        ax = payload.get("ax", payload.get("dyn_x", 0.0))
+        ay = payload.get("ay", payload.get("dyn_y", 0.0))
+        az = payload.get("az", payload.get("dyn_z", 0.0))
+        temp = payload.get("temperature")
+        pres = payload.get("pressure")
+        hum = payload.get("humidity")
+        valve = payload.get("valve_status", "UNKNOWN")
+        gas_raw = payload.get("gas_raw")
+        gas_alert = payload.get("gas_alert")
+        sent_ts = payload.get("ts", payload.get("timestamp"))
+        latency_ms = (time.time() - sent_ts) * 1000.0 if sent_ts else payload.get("latency_ms", 0.0)
+
+        # Ingest semua telemetri ke sensor_telemetry untuk Grafana real-time monitor
+        with ingest_lock:
+            telemetry_ingest_buffer.append((
+                datetime.now(timezone.utc), node_id, pga, rms, ax, ay, az, temp, pres, hum, latency_ms, valve, gas_raw, gas_alert
+            ))
+
         freq_hz = payload.get("freq_hz", 0)
-        
+
         # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
         # 1. PGA >= 0.12 (Getaran harus cukup keras)
         # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
@@ -350,7 +550,7 @@ def on_message(client, userdata, msg):
 
         # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
         is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and freq_hz <= 20)
-        
+
         if not is_real_quake:
             return # Buang hentakan kaki, buku jatuh, dan noise kecil
         
