@@ -540,18 +540,17 @@ def on_message(client, userdata, msg):
 
         freq_hz = payload.get("freq_hz", 0)
 
-        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
+        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI & BENTURAN LOKAL]
         # 1. PGA >= 0.12 (Getaran harus cukup keras)
         # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
-        # 3. Frekuensi <= 20 Hz (Gelombang seismik bumi, bukan ketukan/hentakan sepatu yang tinggi)
-        # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik)
-        # Termasuk data gas, cuaca, dll.
-        save_telemetry(payload)
-
-        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI]
-        is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and freq_hz <= 20)
+        # 3. Frekuensi <= 8 Hz (Gelombang seismik gempa tektonik dominan 0.5 - 7.5 Hz.
+        #    Hentakan langkah kaki, pintu dibanting, dan benda jatuh berfrekuensi tinggi 12 - 35 Hz)
+        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 8.0))
+        is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and is_seismic_freq)
 
         if not is_real_quake:
+            if pga >= 0.12 and not is_seismic_freq:
+                print(f"[FILTER] Getaran lokal dari {node_id} ditolak (PGA:{pga:.3f}G, Freq:{freq_hz}Hz > 8Hz -> Hentakan Kaki/Domestic Shock)")
             return # Buang hentakan kaki, buku jatuh, dan noise kecil
         
         # Gunakan koordinat dari payload jika ada, fallback ke registry
@@ -747,8 +746,11 @@ def run_consensus_logic():
     global trigger_buffer
     now = time.time()
     
-    # Hapus trigger yang usianya lebih dari 60 detik (Expired)
-    trigger_buffer = [t for t in trigger_buffer if (now - t["timestamp"]) <= 60.0]
+    # Hapus trigger yang usianya lebih dari 5.0 detik
+    # Kecepatan gelombang P-Wave di kerak bumi berkisar 3 - 8 km/s, sehingga untuk
+    # cluster sensor dalam radius perumahan/regional (1 - 5 km), selisih waktu tiba
+    # tidak boleh lebih dari 3-5 detik. Menyimpan 60 detik menyebabkan false cross-triggering.
+    trigger_buffer = [t for t in trigger_buffer if (now - t["timestamp"]) <= 5.0]
     
     # Himpun node unik
     unique_nodes = {}
@@ -787,12 +789,13 @@ def run_consensus_logic():
         else:
             kecepatan = jarak_km / selisih_waktu
             print(f"    Jarak: {jarak_km:.2f} km | Δt: {selisih_waktu:.3f}s | Kecepatan: {kecepatan:.2f} km/s")
-            # Toleransi hingga 25 km/s untuk kompensasi pembulatan detik
-            if kecepatan > 0.5 and kecepatan < 25.0:
+            # Kecepatan gelombang P seismik di kerak bumi: 1.5 s/d 12.0 km/s
+            # Atau untuk sensor berdekatan dalam satu area (< 2 km) dengan selisih waktu tiba < 0.5s
+            if (1.5 <= kecepatan <= 12.0) or (selisih_waktu <= 0.5 and jarak_km < 3.0):
                 is_valid = True
                 print(f"[+] KONSENSUS TERCAPAI! Jarak {jarak_km:.2f} KM (Kecepatan {kecepatan:.2f} km/s).")
             else:
-                print(f"    [-] Validasi pair gagal. Kecepatan {kecepatan:.2f} km/s tidak masuk akal.")
+                print(f"    [-] Validasi pair gagal. Kecepatan {kecepatan:.2f} km/s di luar batas fisika seismik.")
                 
         if is_valid:
             fire_alarm(mqtt_client, t1, t2, kecepatan, selisih_waktu)
