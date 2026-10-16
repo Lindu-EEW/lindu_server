@@ -540,6 +540,10 @@ def on_message(client, userdata, msg):
 
         freq_hz = payload.get("freq_hz", 0)
 
+        # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik tb_sensor_telemetry)
+        # Termasuk data gas, cuaca, dll. sebelum filter membuang getaran lokal.
+        save_telemetry(payload)
+
         # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI & BENTURAN LOKAL]
         # 1. PGA >= 0.12 (Getaran harus cukup keras)
         # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
