@@ -16,8 +16,9 @@ TOPIC_STATUS = "lindu/sensor/+/status"
 TOPIC_EVENT  = "lindu/sensor/+/event"
 TOPIC_TELEMETRY = "lindu/sensor/+/telemetry"
 TOPIC_EXTERNAL  = "lindu/external/alert"
-TOPIC_ALARM  = "lindu/actuator/cmd/all"
-TOPIC_LOG    = "lindu/sensor/+/log"
+TOPIC_ALARM     = "lindu/actuator/cmd/all"
+TOPIC_LOG       = "lindu/sensor/+/log"
+TOPIC_OFFLINE   = "lindu/sensor/+/offline_events"
 
 server_start_time = time.time()
 
@@ -491,8 +492,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def on_connect(client, userdata, flags, rc):
     print(f"[SERVER] Terhubung ke MQTT Broker dengan kode {rc}")
-    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0), (TOPIC_LOG, 0)])
-    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}...")
+    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0), (TOPIC_LOG, 0), (TOPIC_OFFLINE, 0)])
+    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}, {TOPIC_OFFLINE}...")
 
 def on_message(client, userdata, msg):
     global trigger_buffer
@@ -565,7 +566,67 @@ def on_message(client, userdata, msg):
                 datetime.now(timezone.utc), node_id, f"Heartbeat: status={status}, pose={pose}, tilt={tilt_angle}°, fw={fw_version}"
             ))
 
-    # 2. EVENT / TELEMETRI (Ada Getaran dari Node)
+    # 2. REKAMAN GEMPA OFFLINE (Store-and-Forward dari Flash Storage LittleFS ESP32)
+    elif "/offline_events" in msg.topic:
+        node_id = payload.get("node_id") or msg.topic.split('/')[2]
+        pga = float(payload.get("pga", 0.0) or 0.0)
+        sta_lta = float(payload.get("sta_lta", 0.0) or 0.0)
+        freq_hz = int(payload.get("freq", payload.get("freq_hz", 0)) or 0)
+        rms = float(payload.get("rms", 0.0) or 0.0)
+        ax = float(payload.get("ax", 0.0) or 0.0)
+        ay = float(payload.get("ay", 0.0) or 0.0)
+        az = float(payload.get("az", 0.0) or 0.0)
+        ml_prob = float(payload.get("ml", payload.get("ml_prob", 0.0)) or 0.0)
+        ml_agree = bool(payload.get("agree", payload.get("ml_agree", True)))
+        is_earthquake = bool(payload.get("quake", True))
+        ts_val = payload.get("ts", time.time())
+        uptime_ms = payload.get("uptime", 0)
+
+        # Simpan ke tb_sensor_telemetry
+        offline_payload = {
+            "node_id": node_id,
+            "ts": ts_val,
+            "pga": pga,
+            "sta_lta": sta_lta,
+            "freq_hz": freq_hz,
+            "rms": rms,
+            "ax": ax,
+            "ay": ay,
+            "az": az,
+            "uptime_ms": uptime_ms,
+            "ml_prob": ml_prob,
+            "ml_agree": ml_agree,
+            "valve_status": "OFFLINE_RECORD",
+            "door_status": "OFFLINE_RECORD"
+        }
+        save_telemetry(offline_payload)
+
+        with ingest_lock:
+            logs_ingest_buffer.append((
+                datetime.now(timezone.utc), node_id,
+                f"[OFFLINE RECOVERY] Gempa tersimpan di flash berhasil disinkronkan: PGA={pga:.4f}g, STA/LTA={sta_lta:.2f}, Freq={freq_hz}Hz, ML={ml_prob*100:.1f}%"
+            ))
+
+        if is_earthquake:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, is_confirmed)
+                        VALUES (to_timestamp(%s), %s, %s, %s, %s, true);
+                    """, (ts_val if ts_val > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz))
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[DB Offline Event Error] {e}")
+                finally:
+                    release_db_connection(conn)
+
+        print(f"[OFFLINE RECOVERY] Rekaman gempa offline dari {node_id} tersimpan di DB: PGA={pga:.4f}g, ML={ml_prob*100:.1f}%")
+        return
+
+    # 3. EVENT / TELEMETRI (Ada Getaran dari Node)
     elif "/telemetry" in msg.topic:
         node_id = payload.get("node_id") or msg.topic.split('/')[2]
         pga = payload.get("pga", 0.0)
