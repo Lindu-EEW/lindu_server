@@ -192,8 +192,15 @@ def init_db():
                 node_id VARCHAR(50),
                 message TEXT
             );
+
+            -- Index performa tinggi untuk Grafana dan TimescaleDB
+            CREATE INDEX IF NOT EXISTS idx_sensor_telemetry_time_node ON sensor_telemetry (time DESC, node_id);
+            CREATE INDEX IF NOT EXISTS idx_tb_sensor_telemetry_ts_node ON tb_sensor_telemetry (ts DESC, node_id);
+            CREATE INDEX IF NOT EXISTS idx_sensor_status_time_node ON sensor_status (time DESC, node_id);
+            CREATE INDEX IF NOT EXISTS idx_tb_node_logs_ts ON tb_node_logs (ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_tb_server_health_ts ON tb_server_health (ts DESC);
         """)
-        print("[DB] Semua tabel dipastikan ada.")
+        print("[DB] Semua tabel dan index performa dipastikan ada.")
         
         # Load memori dari DB agar tidak amnesia setelah restart
         cur.execute("SELECT node_id, lat, lon FROM tb_nodes;")
