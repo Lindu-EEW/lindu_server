@@ -33,6 +33,35 @@ trigger_buffer = []
 active_quake = None
 mqtt_client = None
 
+# ==============================================================================
+# TinyML Dual-Engine / Shadow Mode Server Fallback
+# Menggunakan bobot model TinyML yang sama persis dengan yang ada pada firmware C++ ESP32
+# (dataset/lindu_ml_model.h) untuk memproses telemetri dari node firmware lama (v1.4.95)
+# ==============================================================================
+ML_MEANS = [0.189372, 7.681914, 14.518250, 0.089389, 21.913950, 0.605856]
+ML_STDS  = [0.228498, 7.404773, 12.862055, 0.117197, 19.507890, 0.228757]
+ML_WEIGHTS = [-0.377860, 1.252306, -3.959957, 0.364124, 1.158558, -1.332820]
+ML_BIAS = 0.143630
+
+def predict_tinyml(pga, sta_lta, freq_hz, rms, duration_s=1.0, p_to_s=0.5):
+    """
+    Evaluates seismic event probability using embedded TinyML model.
+    Menghitung probabilitas gempa secara real-time (0.00 - 1.00).
+    """
+    if pga < 0.02:
+        return round(0.01 + (pga / 0.02) * 0.02, 3)
+    effective_freq = freq_hz if freq_hz > 0 else (2.5 if pga >= 0.12 else 18.0)
+    feats = [pga, sta_lta, effective_freq, rms, duration_s, p_to_s]
+    z = ML_BIAS
+    for i in range(6):
+        norm = (feats[i] - ML_MEANS[i]) / ML_STDS[i]
+        z += ML_WEIGHTS[i] * norm
+    if z < -20.0:
+        return 0.0
+    if z > 20.0:
+        return 1.0
+    return round(1.0 / (1.0 + math.exp(-z)), 3)
+
 def init_db():
     conn = None
     for attempt in range(15):
@@ -116,6 +145,10 @@ def init_db():
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS gas_alert BOOLEAN;")
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS door_status VARCHAR(20);")
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS valve_status VARCHAR(20);")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS ml_prob DOUBLE PRECISION DEFAULT 0.0;")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS ml_agree BOOLEAN DEFAULT TRUE;")
+        cur.execute("ALTER TABLE sensor_telemetry ADD COLUMN IF NOT EXISTS ml_prob DOUBLE PRECISION DEFAULT 0.0;")
+        cur.execute("ALTER TABLE sensor_telemetry ADD COLUMN IF NOT EXISTS ml_agree BOOLEAN DEFAULT TRUE;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sensor_telemetry (
                 time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -217,7 +250,11 @@ status_ingest_buffer = []
 logs_ingest_buffer = []
 ingest_lock = threading.Lock()
 
+_last_cpu_idle = 0.0
+_last_cpu_total = 0.0
+
 def db_ingest_writer_thread():
+    global _last_cpu_idle, _last_cpu_total
     last_health_ts = 0
     while True:
         time.sleep(1)
@@ -235,7 +272,7 @@ def db_ingest_writer_thread():
                 try:
                     cur = conn.cursor()
                     execute_values(cur, """
-                        INSERT INTO sensor_telemetry (time, node_id, pga, rms, accel_x, accel_y, accel_z, temperature, pressure, humidity, latency_ms, valve_status, gas_raw, gas_alert)
+                        INSERT INTO sensor_telemetry (time, node_id, pga, rms, accel_x, accel_y, accel_z, temperature, pressure, humidity, latency_ms, valve_status, gas_raw, gas_alert, ml_prob, ml_agree)
                         VALUES %s
                     """, local_telemetry)
                     conn.commit()
@@ -307,11 +344,19 @@ def db_ingest_writer_thread():
                 except Exception:
                     pass
 
-                cpu_pct = 12.0
+                cpu_pct = 4.0
                 try:
-                    with open("/proc/loadavg", "r") as f:
-                        load1 = float(f.readline().split()[0])
-                        cpu_pct = round(min(load1 * 25.0, 100.0), 1)
+                    with open("/proc/stat", "r") as f:
+                        fields = [float(x) for x in f.readline().split()[1:]]
+                        idle = fields[3] + fields[4]
+                        total = sum(fields)
+                        if _last_cpu_total > 0:
+                            idle_delta = idle - _last_cpu_idle
+                            total_delta = total - _last_cpu_total
+                            if total_delta > 0:
+                                cpu_pct = round(max(0.5, min(100.0, 100.0 * (1.0 - idle_delta / total_delta))), 1)
+                        _last_cpu_idle = idle
+                        _last_cpu_total = total
                 except Exception:
                     pass
 
@@ -343,11 +388,13 @@ def save_telemetry(payload):
         cur = conn.cursor()
         
         # Konversi Unix Epoch ke TIMESTAMPTZ secara aman
+        ml_prob = float(payload.get("ml_prob", 0.0) or 0.0)
+        ml_agree = bool(payload.get("ml_agree", True))
         ts_value = payload.get("ts", 0)
         if ts_value and ts_value > 1000000:
             cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status)
-                VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
+                VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 ts_value,
                 payload.get("node_id"),
@@ -363,12 +410,14 @@ def save_telemetry(payload):
                 payload.get("gas_raw", 0),
                 payload.get("gas_alert", False),
                 payload.get("door_status", "UNKNOWN"),
-                payload.get("valve_status", "UNKNOWN")
+                payload.get("valve_status", "UNKNOWN"),
+                ml_prob,
+                ml_agree
             ))
         else:
             cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
+                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, (
                 payload.get("node_id"),
                 payload.get("pga", 0),
@@ -383,7 +432,9 @@ def save_telemetry(payload):
                 payload.get("gas_raw", 0),
                 payload.get("gas_alert", False),
                 payload.get("door_status", "UNKNOWN"),
-                payload.get("valve_status", "UNKNOWN")
+                payload.get("valve_status", "UNKNOWN"),
+                ml_prob,
+                ml_agree
             ))
         conn.commit()
         cur.close()
@@ -532,14 +583,27 @@ def on_message(client, userdata, msg):
         sent_ts = payload.get("ts", payload.get("timestamp"))
         latency_ms = (time.time() - sent_ts) * 1000.0 if sent_ts else payload.get("latency_ms", 0.0)
 
+        freq_hz = payload.get("freq_hz", 0)
+
+        # TinyML Shadow Mode Evaluation
+        if "ml_prob" in payload and payload["ml_prob"] is not None:
+            ml_prob = float(payload.get("ml_prob", 0.0) or 0.0)
+            ml_agree = bool(payload.get("ml_agree", True))
+        else:
+            # Fallback ke Server-side TinyML inference (sama persis dengan TinyML di C++ ESP32)
+            # Menghitung probabilitas gempa real-time untuk firmware node v1.4.95 yang belum flashing OTA
+            ml_prob = predict_tinyml(pga, sta_lta, freq_hz, rms)
+            is_classic_quake = (pga >= 0.12 and (freq_hz == 0 or (0.5 <= freq_hz <= 8.0)))
+            ml_agree = ((ml_prob >= 0.5) == is_classic_quake)
+
+        payload["ml_prob"] = ml_prob
+        payload["ml_agree"] = ml_agree
+
         # Ingest semua telemetri ke sensor_telemetry untuk Grafana real-time monitor
         with ingest_lock:
             telemetry_ingest_buffer.append((
-                datetime.now(timezone.utc), node_id, pga, rms, ax, ay, az, temp, pres, hum, latency_ms, valve, gas_raw, gas_alert
+                datetime.now(timezone.utc), node_id, pga, rms, ax, ay, az, temp, pres, hum, latency_ms, valve, gas_raw, gas_alert, ml_prob, ml_agree
             ))
-
-        freq_hz = payload.get("freq_hz", 0)
-
         # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik tb_sensor_telemetry)
         # Termasuk data gas, cuaca, dll. sebelum filter membuang getaran lokal.
         save_telemetry(payload)
