@@ -2,7 +2,6 @@ import paho.mqtt.client as mqtt
 import json
 import time
 import threading
-import sys
 import random
 
 MQTT_BROKER = "localhost"

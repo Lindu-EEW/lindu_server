@@ -6,7 +6,7 @@ import threading
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 import psycopg2
-from psycopg2 import pool
+import psycopg2.pool
 from psycopg2.extras import execute_values
 
 # Konfigurasi MQTT
@@ -508,8 +508,6 @@ def on_connect(client, userdata, flags, rc):
     print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}, {TOPIC_OFFLINE}...")
 
 def on_message(client, userdata, msg):
-    global trigger_buffer
-    
     payload = None
     try:
         payload = json.loads(msg.payload.decode('utf-8'))
@@ -779,7 +777,6 @@ def on_message(client, userdata, msg):
                     release_db_connection(conn)
             
             # Refine active earthquake if within REFINEMENT_WINDOW_SEC (60 seconds)
-            global active_quake
             if active_quake and (time.time() - active_quake["start_time"]) <= REFINEMENT_WINDOW_SEC:
                 # Update max PGA for this node
                 
@@ -923,7 +920,7 @@ def get_history():
         release_db_connection(conn)
 
 def run_consensus_logic():
-    global trigger_buffer, last_alarm_time
+    global trigger_buffer
     now = time.time()
     
     # 0. JIKA MASIH DALAM JENDELA COOLDOWN GEMPA:
@@ -1016,9 +1013,7 @@ def run_consensus_logic():
     print(f"[-] VALIDASI GAGAL! Tidak ada kecocokan fisika seismik dari {len(unique_nodes)} node.")
 
 def fire_alarm(client, triggering_nodes, group_id, velocity, time_diff, epi_lat=None, epi_lon=None):
-    global active_quake, last_alarm_time, trigger_buffer
-    import time
-    import math
+    global active_quake, last_alarm_time
     
     # COOLDOWN (DEDUPLIKASI GEMPA): Jika alarm sudah pernah dipicu < EVENT_COOLDOWN_SEC lalu,
     # JANGAN membuat alarm baru di database. Biarkan Live Refinement yang bekerja.

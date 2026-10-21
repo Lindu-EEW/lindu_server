@@ -1,5 +1,4 @@
 import unittest
-import math
 from consensus import haversine_km
 
 class TestConsensusEngine(unittest.TestCase):
