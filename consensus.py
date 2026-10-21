@@ -678,10 +678,11 @@ def on_message(client, userdata, msg):
 
         # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI & BENTURAN LOKAL]
         # Multi-Tier Seismic Filtering:
-        # Tier 1: Gempa Ringan / Shindo 1-3 (PGA >= 0.0035g, STA/LTA >= 1.15, Freq <= 15 Hz)
-        # Tier 2: Gempa Kuat / Shindo 4+ (PGA >= 0.05g, Freq <= 15 Hz)
-        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 15.0))
-        is_real_quake = (pga >= 0.0035 and sta_lta >= 1.15 and is_seismic_freq) or (pga >= 0.05 and is_seismic_freq)
+        # Tier 1: Gempa Ringan / Shindo 1-3 (PGA >= 0.0035g, Freq <= 28 Hz untuk mengakomodasi SNR MEMS ZCR)
+        # Tier 2: Gempa Kuat / Shindo 4+ (PGA >= 0.05g)
+        # Catatan: False positive lokal (langkah kaki/meja) difilter oleh Konsensus Spasial Multi-Node (>= 2 Node berjarak fisik)
+        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 28.0))
+        is_real_quake = (pga >= 0.0035 and is_seismic_freq)
 
         if not is_real_quake:
             if pga >= 0.05 and not is_seismic_freq:
