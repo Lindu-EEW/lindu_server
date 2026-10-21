@@ -28,11 +28,13 @@ DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASS = os.getenv("DB_PASS", "postgres")
 DB_NAME = os.getenv("DB_NAME", "lindu_db")
 
-# In-Memory Database (Cache Cepat agar tidak lag saat gempa)
-node_registry = {} 
+node_registry = {}
 trigger_buffer = []
 active_quake = None
 mqtt_client = None
+last_alarm_time = 0.0
+EVENT_COOLDOWN_SEC = 60.0    # Jendela deduplikasi: 1 Gempa hanya menghasilkan TEPAT 1 Master Alert
+REFINEMENT_WINDOW_SEC = 60.0 # Jendela Live Refinement: telemetri selama 60 detik memurnikan gempa yang sama
 
 # ==============================================================================
 # TinyML Dual-Engine / Shadow Mode Server Fallback
@@ -760,9 +762,9 @@ def on_message(client, userdata, msg):
                 finally:
                     release_db_connection(conn)
             
-            # Refine active earthquake if within 15 seconds window
+            # Refine active earthquake if within REFINEMENT_WINDOW_SEC (60 seconds)
             global active_quake
-            if active_quake and (time.time() - active_quake["start_time"]) <= 15.0:
+            if active_quake and (time.time() - active_quake["start_time"]) <= REFINEMENT_WINDOW_SEC:
                 # Update max PGA for this node
                 
                 active_quake["telemetry_count"] += 1
@@ -905,9 +907,16 @@ def get_history():
         release_db_connection(conn)
 
 def run_consensus_logic():
-    global trigger_buffer
+    global trigger_buffer, last_alarm_time
     now = time.time()
     
+    # 0. JIKA MASIH DALAM JENDELA COOLDOWN GEMPA:
+    # Seluruh getaran selama 60 detik berasal dari gempa aktif yang sama.
+    # Jangan buat alert baru di tb_system_alerts; telemetri otomatis dialihkan ke Live Refinement.
+    if (now - last_alarm_time) < EVENT_COOLDOWN_SEC:
+        trigger_buffer.clear()
+        return
+
     # Hapus trigger yang usianya lebih dari 5.0 detik
     trigger_buffer = [t for t in trigger_buffer if (now - t["timestamp"]) <= 5.0]
     
@@ -990,17 +999,15 @@ def run_consensus_logic():
 
     print(f"[-] VALIDASI GAGAL! Tidak ada kecocokan fisika seismik dari {len(unique_nodes)} node.")
 
-last_alarm_time = 0  # Cooldown tracker
-
 def fire_alarm(client, triggering_nodes, group_id, velocity, time_diff, epi_lat=None, epi_lon=None):
     global active_quake, last_alarm_time, trigger_buffer
     import time
     import math
     
-    # COOLDOWN 30 DETIK: Jika alarm sudah pernah dipicu < 30 detik lalu,
-    # JANGAN membuat alarm baru. Biarkan Live Refinement yang bekerja.
-    if time.time() - last_alarm_time < 30:
-        print("[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian 30 detik.")
+    # COOLDOWN (DEDUPLIKASI GEMPA): Jika alarm sudah pernah dipicu < EVENT_COOLDOWN_SEC lalu,
+    # JANGAN membuat alarm baru di database. Biarkan Live Refinement yang bekerja.
+    if time.time() - last_alarm_time < EVENT_COOLDOWN_SEC:
+        print(f"[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian {int(EVENT_COOLDOWN_SEC)} detik.")
         return
     
     last_alarm_time = time.time()
