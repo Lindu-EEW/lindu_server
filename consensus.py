@@ -203,10 +203,10 @@ def init_db():
         print("[DB] Semua tabel dan index performa dipastikan ada.")
         
         # Load memori dari DB agar tidak amnesia setelah restart
-        cur.execute("SELECT node_id, lat, lon FROM tb_nodes;")
+        cur.execute("SELECT node_id, lat, lon, COALESCE(group_id, 'cluster_chiba') FROM tb_nodes;")
         for row in cur.fetchall():
-            node_registry[row[0]] = {"lat": row[1], "lon": row[2], "last_seen": time.time()}
-        print(f"[DB] {len(node_registry)} Node berhasil di-load dari Database ke RAM.")
+            node_registry[row[0]] = {"lat": row[1], "lon": row[2], "group_id": row[3], "last_seen": time.time()}
+        print(f"[DB] {len(node_registry)} Node berhasil di-load dari Database ke RAM (termasuk Group ID).")
         
         cur.close()
         conn.close()
@@ -468,9 +468,10 @@ def save_alert(alarm_payload):
         cur.execute("""
             INSERT INTO tb_system_alerts (
                 source, epi_lat, epi_lon, radius_km, 
-                magnitude, measured_velocity_kms, triggering_nodes, seismic_details, description
+                magnitude, measured_velocity_kms, triggering_nodes, seismic_details, description,
+                group_id, nodes_count
             )
-            VALUES ('LOCAL_CONSENSUS', %s, %s, %s, %s, %s, %s, %s, %s);
+            VALUES ('LOCAL_CONSENSUS', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
         """, (
             alarm_payload["epicenter_lat"],
             alarm_payload["epicenter_lon"],
@@ -479,7 +480,9 @@ def save_alert(alarm_payload):
             alarm_payload.get("measured_velocity_kms", 0),
             nodes_json,
             details_json,
-            alarm_payload["desc"]
+            alarm_payload["desc"],
+            alarm_payload.get("group_id", "cluster_chiba"),
+            alarm_payload.get("nodes_count", len(alarm_payload.get("triggering_nodes", [])))
         ))
         conn.commit()
         cur.close()
@@ -530,10 +533,13 @@ def on_message(client, userdata, msg):
         lat = payload.get("lat")
         lon = payload.get("lon")
         
+        group_id = payload.get("group_id", node_registry.get(node_id, {}).get("group_id", "cluster_chiba"))
+        
         if node_id and lat is not None and lon is not None:
             node_registry[node_id] = {
                 "lat": lat,
                 "lon": lon,
+                "group_id": group_id,
                 "last_seen": time.time()
             }
             
@@ -542,11 +548,11 @@ def on_message(client, userdata, msg):
                 try:
                     cur = conn.cursor()
                     cur.execute("""
-                        INSERT INTO tb_nodes (node_id, role, lat, lon, last_seen) 
-                        VALUES (%s, 'sensor', %s, %s, NOW())
+                        INSERT INTO tb_nodes (node_id, role, lat, lon, group_id, last_seen) 
+                        VALUES (%s, 'sensor', %s, %s, %s, NOW())
                         ON CONFLICT (node_id) 
-                        DO UPDATE SET lat = EXCLUDED.lat, lon = EXCLUDED.lon, last_seen = NOW();
-                    """, (node_id, lat, lon))
+                        DO UPDATE SET lat = EXCLUDED.lat, lon = EXCLUDED.lon, group_id = COALESCE(EXCLUDED.group_id, tb_nodes.group_id), last_seen = NOW();
+                    """, (node_id, lat, lon, group_id))
                     conn.commit()
                     cur.close()
                 except Exception as e:
@@ -690,15 +696,16 @@ def on_message(client, userdata, msg):
             return # Buang hentakan kaki, buku jatuh, dan noise kecil
         
         # Simpan ke tb_sensor_events untuk setiap kandidat getaran gempa yang lolos filter
+        group_id = payload.get("group_id") or node_registry.get(node_id, {}).get("group_id", "cluster_chiba")
         conn_evt = get_db_connection()
         if conn_evt:
             try:
                 cur_evt = conn_evt.cursor()
                 ts_evt = payload.get("ts", time.time())
                 cur_evt.execute("""
-                    INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, is_confirmed)
-                    VALUES (to_timestamp(%s), %s, %s, %s, %s, false);
-                """, (ts_evt if ts_evt > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz))
+                    INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, group_id, is_confirmed)
+                    VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, false);
+                """, (ts_evt if ts_evt > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz, group_id))
                 conn_evt.commit()
                 cur_evt.close()
             except Exception as e:
@@ -717,14 +724,15 @@ def on_message(client, userdata, msg):
                 print(f"[WARNING] Event dari {node_id} diabaikan (Lokasi tidak diketahui)")
                 return
             
-        print(f"[TELE] {node_id} | PGA:{pga:.3f}G | STA/LTA:{sta_lta:.1f} | {payload.get('freq_hz',0)}Hz")
+        print(f"[TELE] {node_id} | PGA:{pga:.3f}G | STA/LTA:{sta_lta:.1f} | {payload.get('freq_hz',0)}Hz | Group:{group_id}")
         
         new_trigger = {
             "node_id": node_id,
             "timestamp": payload.get("ts") or time.time(), # FIX: Gunakan epoch sensor
             "lat": lat,
             "lon": lon,
-            "pga": pga
+            "pga": pga,
+            "group_id": group_id
         }
         trigger_buffer.append(new_trigger)
         run_consensus_logic()
@@ -867,7 +875,7 @@ def get_history():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT time_alert, epi_lat, epi_lon, radius_km, description, magnitude, measured_velocity_kms, triggering_nodes 
+            SELECT time_alert, epi_lat, epi_lon, radius_km, description, magnitude, measured_velocity_kms, triggering_nodes, group_id, nodes_count 
             FROM tb_system_alerts 
             ORDER BY time_alert ASC LIMIT 50;
         """)
@@ -884,7 +892,9 @@ def get_history():
                 "desc": r[4],
                 "magnitude": r[5] or 0.0,
                 "velocity": r[6] or 0.0,
-                "triggering_nodes": r[7] or []
+                "triggering_nodes": r[7] or [],
+                "group_id": r[8] or "cluster_chiba",
+                "nodes_count": r[9] or 2
             })
         cur.close()
         return jsonify(history)
@@ -895,140 +905,175 @@ def get_history():
         release_db_connection(conn)
 
 def run_consensus_logic():
-
     global trigger_buffer
     now = time.time()
     
     # Hapus trigger yang usianya lebih dari 5.0 detik
-    # Kecepatan gelombang P-Wave di kerak bumi berkisar 3 - 8 km/s, sehingga untuk
-    # cluster sensor dalam radius perumahan/regional (1 - 5 km), selisih waktu tiba
-    # tidak boleh lebih dari 3-5 detik. Menyimpan 60 detik menyebabkan false cross-triggering.
     trigger_buffer = [t for t in trigger_buffer if (now - t["timestamp"]) <= 5.0]
     
-    # Himpun node unik
+    # Himpun node unik (simpan trigger dengan pga tertinggi jika ada duplikat dalam 5s)
     unique_nodes = {}
     for t in trigger_buffer:
-        if t["node_id"] not in unique_nodes:
-            unique_nodes[t["node_id"]] = t
+        nid = t["node_id"]
+        if nid not in unique_nodes or t["pga"] > unique_nodes[nid]["pga"]:
+            unique_nodes[nid] = t
             
-    nodes = list(unique_nodes.values())
-    
-    if len(nodes) < 2:
+    if len(unique_nodes) < 2:
         return
         
     import itertools
-    # Evaluasi setiap kemungkinan pasang node dalam buffer
-    for t1, t2 in itertools.combinations(nodes, 2):
+    
+    # Kelompokkan node berdasarkan group_id
+    groups = {}
+    for t in unique_nodes.values():
+        gid = t.get("group_id", "cluster_chiba")
+        if gid not in groups:
+            groups[gid] = []
+        groups[gid].append(t)
+
+    # 1. EVALUASI KONSENSUS DALAM GRUP (INTRA-GROUP QUORUM)
+    for gid, g_nodes in groups.items():
+        # A. TRI-NODE / MULTI-NODE QUORUM (>= 3 Node dalam 1 Group)
+        if len(g_nodes) >= 3:
+            t_min = min(n["timestamp"] for n in g_nodes)
+            t_max = max(n["timestamp"] for n in g_nodes)
+            selisih_waktu = t_max - t_min
+            
+            # Hitung jarak terjauh antar pasangan dalam grup
+            max_jarak = max(haversine_km(n1["lat"], n1["lon"], n2["lat"], n2["lon"]) 
+                            for n1, n2 in itertools.combinations(g_nodes, 2))
+            
+            kecepatan = max_jarak / selisih_waktu if selisih_waktu > 0.05 else 6.0
+            print(f"\n[+] KONSENSUS TRI-NODE GRUP '{gid}' TERCAPAI! {len(g_nodes)} Node serentak bergetar!")
+            print(f"    Nodes: {[n['node_id'] for n in g_nodes]} | Δt: {selisih_waktu:.2f}s | Max Dist: {max_jarak:.2f} km")
+            
+            fire_alarm(mqtt_client, g_nodes, gid, kecepatan, selisih_waktu)
+            return
+
+        # B. PAIRWISE CONSENSUS (2 Node dalam 1 Group)
+        elif len(g_nodes) == 2:
+            t1, t2 = g_nodes[0], g_nodes[1]
+            jarak_km = haversine_km(t1["lat"], t1["lon"], t2["lat"], t2["lon"])
+            selisih_waktu = abs(t2["timestamp"] - t1["timestamp"])
+            
+            is_valid = False
+            if jarak_km < 0.1:
+                kecepatan = 6.0
+                is_valid = True
+                print(f"[KONSENSUS] 2 Node di area yang sama bergetar (Grup '{gid}'). Validasi Fisika di-bypass.")
+            elif selisih_waktu == 0:
+                kecepatan = 6.0
+                is_valid = True
+                print(f"[+] KONSENSUS PAIRWISE (Grup '{gid}') TERCAPAI! Gelombang tiba bersamaan di kedua sensor.")
+            else:
+                kecepatan = jarak_km / selisih_waktu
+                if (1.5 <= kecepatan <= 12.0) or (selisih_waktu <= 0.5 and jarak_km < 3.0):
+                    is_valid = True
+                    print(f"[+] KONSENSUS PAIRWISE (Grup '{gid}') TERCAPAI! Jarak {jarak_km:.2f} KM (Kecepatan {kecepatan:.2f} km/s).")
+                    
+            if is_valid:
+                fire_alarm(mqtt_client, [t1, t2], gid, kecepatan, selisih_waktu)
+                return
+
+    # 2. FALLBACK CROSS-GROUP PAIRWISE (Jika node berasal dari grup berbeda)
+    all_nodes = list(unique_nodes.values())
+    for t1, t2 in itertools.combinations(all_nodes, 2):
+        if t1.get("group_id") == t2.get("group_id"):
+            continue
         jarak_km = haversine_km(t1["lat"], t1["lon"], t2["lat"], t2["lon"])
         selisih_waktu = abs(t2["timestamp"] - t1["timestamp"])
-        
-        # Jika jarak terlalu dekat (misal di ruangan yang sama), anggap valid langsung
-        if jarak_km < 0.1:
-            print(f"[KONSENSUS] 2 Node di area yang sama bergetar. Validasi Fisika di-bypass.")
-            fire_alarm(mqtt_client, t1, t2, 0.0, 0.0)
+        kecepatan = 6.0 if selisih_waktu == 0 else (jarak_km / selisih_waktu)
+        if (selisih_waktu == 0) or (1.5 <= kecepatan <= 12.0) or (selisih_waktu <= 0.5 and jarak_km < 3.0):
+            print(f"[+] KONSENSUS LINTAS-GRUP TERCAPAI! {t1['node_id']} & {t2['node_id']}")
+            fire_alarm(mqtt_client, [t1, t2], "cross_group", kecepatan, selisih_waktu)
             return
-            
-        # HUKUM FISIKA & KETERBATASAN WAKTU
-        print(f"[*] Mengevaluasi {t1['node_id']} & {t2['node_id']}")
-        
-        is_valid = False
-        if selisih_waktu == 0:
-            # 1. Episentrum berada persis di tengah kedua node (equidistant)
-            # 2. Rambatan terjadi di bawah 1 detik (karena presisi timestamp ESP32 hanya 1 detik)
-            kecepatan = 6.0 # Asumsi kecepatan standar P-Wave
-            is_valid = True
-            print(f"    Jarak: {jarak_km:.2f} km | Δt: 0.000s -> EPISENTRUM EQUIDISTANT / SIMULTAN")
-            print(f"[+] KONSENSUS TERCAPAI! Gelombang tiba bersamaan di kedua sensor.")
-        else:
-            kecepatan = jarak_km / selisih_waktu
-            print(f"    Jarak: {jarak_km:.2f} km | Δt: {selisih_waktu:.3f}s | Kecepatan: {kecepatan:.2f} km/s")
-            # Kecepatan gelombang P seismik di kerak bumi: 1.5 s/d 12.0 km/s
-            # Atau untuk sensor berdekatan dalam satu area (< 2 km) dengan selisih waktu tiba < 0.5s
-            if (1.5 <= kecepatan <= 12.0) or (selisih_waktu <= 0.5 and jarak_km < 3.0):
-                is_valid = True
-                print(f"[+] KONSENSUS TERCAPAI! Jarak {jarak_km:.2f} KM (Kecepatan {kecepatan:.2f} km/s).")
-            else:
-                print(f"    [-] Validasi pair gagal. Kecepatan {kecepatan:.2f} km/s di luar batas fisika seismik.")
-                
-        if is_valid:
-            fire_alarm(mqtt_client, t1, t2, kecepatan, selisih_waktu)
-            return  # Selesai, buffer sudah dikosongkan di fire_alarm
-            
-    # Jika sampai di sini, artinya tidak ada pasangan yang valid (semua False Positive). 
-    # Mereka akan terus tertahan di buffer sampai expired (60 detik).
-    print(f"[-] VALIDASI GAGAL! Tidak ada pasangan node yang masuk akal secara fisika dari {len(nodes)} node.")
+
+    print(f"[-] VALIDASI GAGAL! Tidak ada kecocokan fisika seismik dari {len(unique_nodes)} node.")
 
 last_alarm_time = 0  # Cooldown tracker
 
-def fire_alarm(client, t1, t2, velocity, time_diff):
-    global active_quake, last_alarm_time
+def fire_alarm(client, triggering_nodes, group_id, velocity, time_diff, epi_lat=None, epi_lon=None):
+    global active_quake, last_alarm_time, trigger_buffer
     import time
+    import math
     
-    # COOLDOWN 60 DETIK: Jika alarm sudah pernah dipicu < 60 detik lalu,
+    # COOLDOWN 30 DETIK: Jika alarm sudah pernah dipicu < 30 detik lalu,
     # JANGAN membuat alarm baru. Biarkan Live Refinement yang bekerja.
     if time.time() - last_alarm_time < 30:
         print("[COOLDOWN] Alarm diabaikan. Gempa ini masih dalam jendela pemurnian 30 detik.")
         return
     
     last_alarm_time = time.time()
-    active_quake = {
-        'start_time': time.time(),
-        'initial_lat': (t1["lat"] + t2["lat"]) / 2,
-        'initial_lon': (t1["lon"] + t2["lon"]) / 2,
-        'telemetry_count': 0,
-        'nodes_pga': {t1['node_id']: t1.get('pga',0.1), t2['node_id']: t2.get('pga',0.1)},
-        'nodes_coords': {t1['node_id']: (t1['lat'], t1['lon']), t2['node_id']: (t2['lat'], t2['lon'])}
-    }
-    global trigger_buffer
-    import math
-    
-    # Episentrum diprediksi berada di tengah-tengah kedua node (Midpoint Approximation)
-    epi_lat = (t1["lat"] + t2["lat"]) / 2
-    epi_lon = (t1["lon"] + t2["lon"]) / 2
-    
-    # Estimasi Magnitudo berdasarkan rata-rata PGA
-    avg_pga = (t1["pga"] + t2["pga"]) / 2.0
+    nodes_count = len(triggering_nodes)
+
+    # Weighted Barycenter untuk Episentrum
+    if epi_lat is None or epi_lon is None:
+        total_pga = sum(max(0.0001, n.get("pga", 0.001)) for n in triggering_nodes)
+        epi_lat = sum(n["lat"] * max(0.0001, n.get("pga", 0.001)) for n in triggering_nodes) / total_pga
+        epi_lon = sum(n["lon"] * max(0.0001, n.get("pga", 0.001)) for n in triggering_nodes) / total_pga
+
+    avg_pga = sum(n.get("pga", 0.001) for n in triggering_nodes) / nodes_count
+    max_pga = max(n.get("pga", 0.001) for n in triggering_nodes)
     safe_pga = max(0.001, avg_pga)
-    # Skala empiris gempa lokal: PGA 0.003 - 0.01g setara M3.2 - M4.2; PGA >= 0.05g setara M5.0+
+
     magnitude = round(4.0 + 1.5 * math.log10(safe_pga / 0.008), 1)
     magnitude = max(2.5, min(9.5, magnitude))
-    
-    # Radius Bahaya Dinamis Berdasarkan Magnitudo
     dynamic_radius = round(10 ** (0.5 * magnitude - 1.0), 1)
-    
-    is_critical = (avg_pga >= 0.05)
+
+    is_critical = (avg_pga >= 0.05 or max_pga >= 0.08)
     alarm_level = "CRITICAL" if is_critical else "ADVISORY"
     alarm_cmd = "trigger_siren" if is_critical else "quake_advisory"
+
+    confidence = 100 if nodes_count >= 3 else 95
+
+    node_details = [
+        {"id": n["node_id"], "lat": n["lat"], "lon": n["lon"], "pga": n.get("pga", 0)}
+        for n in triggering_nodes
+    ]
+    node_str = ", ".join([f"{n['node_id']} ({n.get('pga',0):.4f}G)" for n in triggering_nodes])
+
+    if nodes_count >= 3:
+        desc = f"{'🚨 Peringatan Darurat Gempa Kuat!' if is_critical else 'ℹ️ Gempa Terdeteksi (Advisory)'} [TRI-NODE QUORUM Grup {group_id}] {nodes_count} node serentak terpicu ({node_str}) dlm Δt={time_diff:.2f}s. Kecepatan P-Wave: {velocity:.1f} km/s."
+    else:
+        desc = f"{'🚨 Peringatan Darurat Gempa Kuat!' if is_critical else 'ℹ️ Gempa Terdeteksi (Advisory)'} [KONSENSUS PAIRWISE Grup {group_id}] Sensor {node_str} dlm Δt={time_diff:.2f}s. Kecepatan P-Wave: {velocity:.1f} km/s."
 
     alarm_payload = {
         "cmd": alarm_cmd,
         "level": alarm_level,
+        "group_id": group_id,
+        "nodes_count": nodes_count,
         "epicenter_lat": epi_lat,
         "epicenter_lon": epi_lon,
         "radius_km": dynamic_radius,
-        "confidence": 95,
+        "confidence": confidence,
         "magnitude": magnitude,
         "measured_velocity_kms": round(velocity, 2),
         "time_diff_s": round(time_diff, 2),
-        "triggering_nodes": [
-            {"id": t1["node_id"], "lat": t1["lat"], "lon": t1["lon"], "pga": t1.get("pga", 0)},
-            {"id": t2["node_id"], "lat": t2["lat"], "lon": t2["lon"], "pga": t2.get("pga", 0)}
-        ],
-        "desc": f"{'🚨 Peringatan Darurat Gempa Kuat!' if is_critical else 'ℹ️ Gempa Terdeteksi (Advisory)'} Sensor {t1['node_id']} ({t1.get('pga',0):.4f}G), divalidasi oleh {t2['node_id']} ({t2.get('pga',0):.4f}G) dlm {time_diff:.1f}s. Kecepatan P-Wave: {velocity:.1f} km/s."
+        "triggering_nodes": node_details,
+        "desc": desc
     }
-    
+
+    active_quake = {
+        'start_time': time.time(),
+        'initial_lat': epi_lat,
+        'initial_lon': epi_lon,
+        'telemetry_count': 0,
+        'group_id': group_id,
+        'nodes_pga': {n['node_id']: n.get('pga', 0.1) for n in triggering_nodes},
+        'nodes_coords': {n['node_id']: (n['lat'], n['lon']) for n in triggering_nodes}
+    }
+
     print("\n=======================================================")
-    print(f"🚨 KONSENSUS TERCAPAI! GEMPA M {magnitude} [{alarm_level}] TERDETEKSI! 🚨")
+    print(f"🚨 KONSENSUS TERCAPAI! GEMPA M {magnitude} [{alarm_level}] ({nodes_count} NODES / GROUP {group_id}) 🚨")
     print(json.dumps(alarm_payload, indent=2))
     print("=======================================================\n")
-    
+
     # Broadcast ke sistem
     client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
     client.publish("lindu/sensor/cmd/all", json.dumps(alarm_payload))
     if is_critical:
-        # Aktuator (tutup valve gas & buka door lock) hanya aktif untuk gempa kritis (PGA >= 0.05g)
         client.publish("lindu/actuator/cmd/all", json.dumps(alarm_payload))
-    
+
     # Simpan ke database (Black Box)
     save_alert(alarm_payload)
 
@@ -1037,18 +1082,19 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
         conn_conf = get_db_connection()
         if conn_conf:
             cur_conf = conn_conf.cursor()
+            node_ids = [n["node_id"] for n in triggering_nodes]
             cur_conf.execute("""
                 UPDATE tb_sensor_events 
                 SET is_confirmed = true 
                 WHERE time_event >= NOW() - INTERVAL '30 seconds'
-                  AND node_id IN (%s, %s);
-            """, (t1["node_id"], t2["node_id"]))
+                  AND node_id = ANY(%s);
+            """, (node_ids,))
             conn_conf.commit()
             cur_conf.close()
             release_db_connection(conn_conf)
     except Exception as e:
         print("[DB Confirm Event Error]", e)
-    
+
     # Kosongkan buffer agar tidak spam alarm berkali-kali
     trigger_buffer.clear()
 
@@ -1119,7 +1165,7 @@ def get_nodes():
         return jsonify([]), 200
     try:
         cur = conn.cursor()
-        cur.execute("SELECT node_id, lat, lon, last_seen FROM tb_nodes;")
+        cur.execute("SELECT node_id, lat, lon, COALESCE(group_id, 'cluster_chiba'), last_seen FROM tb_nodes;")
         rows = cur.fetchall()
         
         nodes = []
@@ -1128,7 +1174,8 @@ def get_nodes():
                 "node_id": r[0],
                 "lat": r[1],
                 "lon": r[2],
-                "last_seen": r[3].strftime("%Y-%m-%d %H:%M:%S") if r[3] else None
+                "group_id": r[3],
+                "last_seen": r[4].strftime("%Y-%m-%d %H:%M:%S") if r[4] else None
             })
         cur.close()
         return jsonify(nodes)
