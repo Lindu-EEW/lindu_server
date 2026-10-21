@@ -76,11 +76,14 @@ def evaluate_consensus(trigger_candidates):
         if is_valid:
             valid_nodes.append(t)
 
-    # Spatial Consensus (At least 2 nodes required)
-    if len(valid_nodes) < 2:
-        if len(valid_nodes) == 1:
-            return False, "NONE", f"DITOLAK: Hanya 1 node ({valid_nodes[0]['node_id']}) yang aktif. Syarat konsensus minimal 2 node.", 0.0
-        return False, "NONE", "DITOLAK: Seluruh getaran difilter sebagai noise mekanis/domestik non-seismik.", 0.0
+    # Spatial Consensus Skalabilitas Grup:
+    # Jika dalam 1 grup terdapat 3 node, syarat konsensus MENINGKAT: WAJIB minimal 3 node (Tri-Node Quorum)!
+    # Tidak boleh hanya 2 node yang menentukan gempa jika dalam 1 grup ada 3 node.
+    required_quorum = 3  # Cluster Chiba memiliki 3 node terdaftar
+    if len(valid_nodes) < required_quorum:
+        if len(valid_nodes) == 0:
+            return False, "NONE", "DITOLAK: Seluruh getaran difilter sebagai noise mekanis/domestik non-seismik.", 0.0
+        return False, "NONE", f"DITOLAK: Baru {len(valid_nodes)} node aktif. Syarat konsensus grup beranggotakan 3 node WAJIB minimal {required_quorum} node (Tri-Node Quorum)!", 0.0
 
     # Quorum Evaluation
     nodes_count = len(valid_nodes)
@@ -94,10 +97,7 @@ def evaluate_consensus(trigger_candidates):
     is_critical = (avg_pga >= 0.05 or max_pga >= 0.08)
     level = "CRITICAL" if is_critical else "ADVISORY"
 
-    if nodes_count >= 3:
-        desc = f"TRI-NODE QUORUM TERCAPAI! 3 Node serentak terkonfirmasi. Tingkat: {level}, Estimasi M {magnitude}."
-    else:
-        desc = f"PAIRWISE CONSENSUS TERCAPAI! 2 Node terkonfirmasi. Tingkat: {level}, Estimasi M {magnitude}."
+    desc = f"TRI-NODE QUORUM TERCAPAI! {nodes_count} Node serentak terkonfirmasi dalam 1 grup. Tingkat: {level}, Estimasi M {magnitude}."
 
     return True, level, desc, magnitude
 
@@ -222,6 +222,19 @@ def run_event_comparison():
             "actual_shaking_duration": "65.0 detik (Guncangan Dahsyat)",
             "valve_expected": "AUTO-SHUTOFF (Relay Tutup Katup Gas)",
             "expected_alarm": True
+        },
+        {
+            "id": "EVENT_6_TWO_NODE_DESK_BUMP",
+            "name": "Hanya 2 Node Terbentur di Meja (1 Node Tenang dalam Grup 3 Node)",
+            "type": "PARTIAL_GROUP_DISTURBANCE",
+            "raw_nodes": [
+                {"node_id": "node_acbd13f9", "pga": 0.0097, "sta_lta": 1.28, "freq_hz": 13, "ml_prob": 0.42},
+                {"node_id": "node_2418399e", "pga": 0.0150, "sta_lta": 1.35, "freq_hz": 12, "ml_prob": 0.45},
+                {"node_id": "node_3c096f0c", "pga": 0.0010, "sta_lta": 0.90, "freq_hz": 14, "ml_prob": 0.01}
+            ],
+            "actual_shaking_duration": "0.0 detik (Bukan Gempa)",
+            "valve_expected": "STANDBY (Tetap Terbuka)",
+            "expected_alarm": False
         }
     ]
 

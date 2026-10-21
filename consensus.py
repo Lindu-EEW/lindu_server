@@ -956,60 +956,39 @@ def run_consensus_logic():
             groups[gid] = []
         groups[gid].append(t)
 
-    # 1. EVALUASI KONSENSUS DALAM GRUP (INTRA-GROUP QUORUM)
+    # 1. EVALUASI KONSENSUS DALAM GRUP (INTRA-GROUP QUORUM DENGAN SYARAT DINAMIS)
     for gid, g_nodes in groups.items():
-        # A. TRI-NODE / MULTI-NODE QUORUM (>= 3 Node dalam 1 Group)
-        if len(g_nodes) >= 3:
+        total_registered = sum(1 for n in node_registry.values() if n.get("group_id") == gid)
+        
+        # SKALABILITAS KONSENSUS DINAMIS:
+        # Jika dalam 1 grup ada 3 node terdaftar, syarat konsensus MENINGKAT: WAJIB minimal 3 node (Tri-Node Quorum)!
+        # Tidak boleh hanya 2 node yang menentukan gempa jika dalam grup tersebut terdapat 3 node.
+        # Jika grup ada >= 4 node, syarat konsensus adalah minimal 3 node atau 67% dari grup.
+        # Hanya grup yang memang HANYA memiliki 2 node terdaftar yang diizinkan konsensus 2 node.
+        if total_registered <= 1:
+            required_quorum = 2
+        elif total_registered <= 3:
+            required_quorum = total_registered  # Grup 2 node butuh 2, grup 3 node BUTUH 3!
+        else:
+            required_quorum = max(3, math.ceil(total_registered * 0.67))
+
+        if len(g_nodes) >= required_quorum:
             t_min = min(n["timestamp"] for n in g_nodes)
             t_max = max(n["timestamp"] for n in g_nodes)
             selisih_waktu = t_max - t_min
             
             # Hitung jarak terjauh antar pasangan dalam grup
             max_jarak = max(haversine_km(n1["lat"], n1["lon"], n2["lat"], n2["lon"]) 
-                            for n1, n2 in itertools.combinations(g_nodes, 2))
+                            for n1, n2 in itertools.combinations(g_nodes, 2)) if len(g_nodes) > 1 else 0.1
             
             kecepatan = max_jarak / selisih_waktu if selisih_waktu > 0.05 else 6.0
-            print(f"\n[+] KONSENSUS TRI-NODE GRUP '{gid}' TERCAPAI! {len(g_nodes)} Node serentak bergetar!")
+            print(f"\n[+] KONSENSUS GRUP '{gid}' TERCAPAI! {len(g_nodes)}/{total_registered} Node serentak bergetar (Syarat Quorum: {required_quorum} Node)!")
             print(f"    Nodes: {[n['node_id'] for n in g_nodes]} | Δt: {selisih_waktu:.2f}s | Max Dist: {max_jarak:.2f} km")
             
             fire_alarm(mqtt_client, g_nodes, gid, kecepatan, selisih_waktu)
             return
-
-        # B. PAIRWISE CONSENSUS (2 Node dalam 1 Group)
-        elif len(g_nodes) == 2:
-            t1, t2 = g_nodes[0], g_nodes[1]
-            jarak_km = haversine_km(t1["lat"], t1["lon"], t2["lat"], t2["lon"])
-            selisih_waktu = abs(t2["timestamp"] - t1["timestamp"])
-            
-            # CEK TOTAL NODE TERDAFTAR DALAM GRUP INI:
-            total_registered = sum(1 for n in node_registry.values() if n.get("group_id") == gid)
-            max_pga = max(t1.get("pga", 0), t2.get("pga", 0))
-
-            # Jika grup memiliki >= 3 node terdaftar, 2 node HANYA diizinkan jika
-            # guncangan signifikan / kuat (PGA >= 0.05g) sebagai emergency fail-safe.
-            # Getaran mikro (< 0.05g) pada 2 node WAJIB ditolak karena terindikasi sentuhan meja lokal.
-            if total_registered >= 3 and max_pga < 0.05:
-                print(f"[-] PAIRWISE DITOLAK: Grup '{gid}' punya {total_registered} node, tapi hanya 2 bergetar lemah (PGA: {max_pga:.4f}G < 0.05G). Noise meja lokal diabaikan.")
-                continue
-
-            is_valid = False
-            if jarak_km < 0.1:
-                kecepatan = 6.0
-                is_valid = True
-                print(f"[KONSENSUS] 2 Node di area yang sama bergetar (Grup '{gid}'). Validasi Fisika di-bypass.")
-            elif selisih_waktu == 0:
-                kecepatan = 6.0
-                is_valid = True
-                print(f"[+] KONSENSUS PAIRWISE (Grup '{gid}') TERCAPAI! Gelombang tiba bersamaan di kedua sensor.")
-            else:
-                kecepatan = jarak_km / selisih_waktu
-                if (1.5 <= kecepatan <= 12.0) or (selisih_waktu <= 0.5 and jarak_km < 3.0):
-                    is_valid = True
-                    print(f"[+] KONSENSUS PAIRWISE (Grup '{gid}') TERCAPAI! Jarak {jarak_km:.2f} KM (Kecepatan {kecepatan:.2f} km/s).")
-                    
-            if is_valid:
-                fire_alarm(mqtt_client, [t1, t2], gid, kecepatan, selisih_waktu)
-                return
+        else:
+            print(f"[-] KONSENSUS GRUP '{gid}' BELUM TERCAPAI: Baru {len(g_nodes)} node aktif. Syarat grup '{gid}' ({total_registered} node terdaftar) adalah minimal {required_quorum} node!")
 
     # 2. FALLBACK CROSS-GROUP PAIRWISE (Jika node berasal dari grup berbeda)
     all_nodes = list(unique_nodes.values())
