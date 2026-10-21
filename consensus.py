@@ -956,21 +956,28 @@ def run_consensus_logic():
             groups[gid] = []
         groups[gid].append(t)
 
-    # 1. EVALUASI KONSENSUS DALAM GRUP (INTRA-GROUP QUORUM DENGAN SYARAT DINAMIS)
+    # 1. EVALUASI KONSENSUS DALAM GRUP (INTRA-GROUP DYNAMIC QUORUM ADAPTIF)
+    now_ts = time.time()
     for gid, g_nodes in groups.items():
         total_registered = sum(1 for n in node_registry.values() if n.get("group_id") == gid)
         
-        # SKALABILITAS KONSENSUS DINAMIS:
-        # Jika dalam 1 grup ada 3 node terdaftar, syarat konsensus MENINGKAT: WAJIB minimal 3 node (Tri-Node Quorum)!
-        # Tidak boleh hanya 2 node yang menentukan gempa jika dalam grup tersebut terdapat 3 node.
-        # Jika grup ada >= 4 node, syarat konsensus adalah minimal 3 node atau 67% dari grup.
-        # Hanya grup yang memang HANYA memiliki 2 node terdaftar yang diizinkan konsensus 2 node.
-        if total_registered <= 1:
+        # Hitung berapa node dalam grup ini yang sedang aktif / online (heartbeat <= 60s)
+        active_online_in_group = sum(
+            1 for n in node_registry.values() 
+            if n.get("group_id") == gid and (now_ts - n.get("last_seen", 0) <= 60)
+        )
+        effective_count = active_online_in_group if active_online_in_group >= 2 else total_registered
+
+        # ATURAN SKALABILITAS OTOMATIS:
+        # 1. Jika grup hanya memiliki 2 node aktif   -> Quorum = 2 Node (100% grup kecil)
+        # 2. Jika grup memiliki 3 node aktif         -> Quorum = 3 Node (100% Tri-Node, anti sentuhan meja)
+        # 3. Jika grup memiliki >= 4 node aktif       -> Quorum = max(3, ceil(N * 0.67)) (Toleransi node lagging)
+        if effective_count <= 2:
             required_quorum = 2
-        elif total_registered <= 3:
-            required_quorum = total_registered  # Grup 2 node butuh 2, grup 3 node BUTUH 3!
+        elif effective_count == 3:
+            required_quorum = 3
         else:
-            required_quorum = max(3, math.ceil(total_registered * 0.67))
+            required_quorum = max(3, math.ceil(effective_count * 0.67))
 
         if len(g_nodes) >= required_quorum:
             t_min = min(n["timestamp"] for n in g_nodes)
