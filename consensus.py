@@ -677,17 +677,33 @@ def on_message(client, userdata, msg):
         save_telemetry(payload)
 
         # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI & BENTURAN LOKAL]
-        # 1. PGA >= 0.12 (Getaran harus cukup keras)
-        # 2. STA/LTA >= 2.0 (Energi getaran harus berkelanjutan, bukan benturan singkat)
-        # 3. Frekuensi <= 8 Hz (Gelombang seismik gempa tektonik dominan 0.5 - 7.5 Hz.
-        #    Hentakan langkah kaki, pintu dibanting, dan benda jatuh berfrekuensi tinggi 12 - 35 Hz)
-        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 8.0))
-        is_real_quake = (pga >= 0.12 and sta_lta >= 2.0 and is_seismic_freq)
+        # Multi-Tier Seismic Filtering:
+        # Tier 1: Gempa Ringan / Shindo 1-3 (PGA >= 0.0035g, STA/LTA >= 1.15, Freq <= 15 Hz)
+        # Tier 2: Gempa Kuat / Shindo 4+ (PGA >= 0.05g, Freq <= 15 Hz)
+        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 15.0))
+        is_real_quake = (pga >= 0.0035 and sta_lta >= 1.15 and is_seismic_freq) or (pga >= 0.05 and is_seismic_freq)
 
         if not is_real_quake:
-            if pga >= 0.12 and not is_seismic_freq:
-                print(f"[FILTER] Getaran lokal dari {node_id} ditolak (PGA:{pga:.3f}G, Freq:{freq_hz}Hz > 8Hz -> Hentakan Kaki/Domestic Shock)")
+            if pga >= 0.05 and not is_seismic_freq:
+                print(f"[FILTER] Getaran lokal keras dari {node_id} ditolak (PGA:{pga:.3f}G, Freq:{freq_hz}Hz > 15Hz -> Hentakan Kaki/Domestic Shock)")
             return # Buang hentakan kaki, buku jatuh, dan noise kecil
+        
+        # Simpan ke tb_sensor_events untuk setiap kandidat getaran gempa yang lolos filter
+        conn_evt = get_db_connection()
+        if conn_evt:
+            try:
+                cur_evt = conn_evt.cursor()
+                ts_evt = payload.get("ts", time.time())
+                cur_evt.execute("""
+                    INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, is_confirmed)
+                    VALUES (to_timestamp(%s), %s, %s, %s, %s, false);
+                """, (ts_evt if ts_evt > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz))
+                conn_evt.commit()
+                cur_evt.close()
+            except Exception as e:
+                print(f"[DB Sensor Event Error] {e}")
+            finally:
+                release_db_connection(conn_evt)
         
         # Gunakan koordinat dari payload jika ada, fallback ke registry
         lat = payload.get("lat")
@@ -972,15 +988,20 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
     # Estimasi Magnitudo berdasarkan rata-rata PGA
     avg_pga = (t1["pga"] + t2["pga"]) / 2.0
     safe_pga = max(0.001, avg_pga)
-    magnitude = round(5.0 + 1.5 * math.log10(safe_pga / 0.1), 1)
-    magnitude = max(3.0, min(9.5, magnitude))
+    # Skala empiris gempa lokal: PGA 0.003 - 0.01g setara M3.2 - M4.2; PGA >= 0.05g setara M5.0+
+    magnitude = round(4.0 + 1.5 * math.log10(safe_pga / 0.008), 1)
+    magnitude = max(2.5, min(9.5, magnitude))
     
     # Radius Bahaya Dinamis Berdasarkan Magnitudo
     dynamic_radius = round(10 ** (0.5 * magnitude - 1.0), 1)
     
+    is_critical = (avg_pga >= 0.05)
+    alarm_level = "CRITICAL" if is_critical else "ADVISORY"
+    alarm_cmd = "trigger_siren" if is_critical else "quake_advisory"
+
     alarm_payload = {
-        "cmd": "trigger_siren",
-        "level": "CRITICAL",
+        "cmd": alarm_cmd,
+        "level": alarm_level,
         "epicenter_lat": epi_lat,
         "epicenter_lon": epi_lon,
         "radius_km": dynamic_radius,
@@ -992,21 +1013,40 @@ def fire_alarm(client, t1, t2, velocity, time_diff):
             {"id": t1["node_id"], "lat": t1["lat"], "lon": t1["lon"], "pga": t1.get("pga", 0)},
             {"id": t2["node_id"], "lat": t2["lat"], "lon": t2["lon"], "pga": t2.get("pga", 0)}
         ],
-        "desc": f"⚠️ Peringatan Dini! Sensor {t1['node_id']} mencatat guncangan (PGA {t1.get('pga',0):.2f}G), divalidasi oleh {t2['node_id']} ({t2.get('pga',0):.2f}G) dalam {time_diff:.1f} detik. Rambatan P-Wave terukur {velocity:.1f} km/s (Fisika Valid)."
+        "desc": f"{'🚨 Peringatan Darurat Gempa Kuat!' if is_critical else 'ℹ️ Gempa Terdeteksi (Advisory)'} Sensor {t1['node_id']} ({t1.get('pga',0):.4f}G), divalidasi oleh {t2['node_id']} ({t2.get('pga',0):.4f}G) dlm {time_diff:.1f}s. Kecepatan P-Wave: {velocity:.1f} km/s."
     }
     
     print("\n=======================================================")
-    print(f"🚨 KONSENSUS TERCAPAI! GEMPA M {magnitude} TERDETEKSI! 🚨")
+    print(f"🚨 KONSENSUS TERCAPAI! GEMPA M {magnitude} [{alarm_level}] TERDETEKSI! 🚨")
     print(json.dumps(alarm_payload, indent=2))
     print("=======================================================\n")
     
-    # Broadcast alarm ke semua kemungkinan topik sensor dan aktuator
+    # Broadcast ke sistem
     client.publish(TOPIC_ALARM, json.dumps(alarm_payload))
-    client.publish("lindu/actuator/cmd/all", json.dumps(alarm_payload))
     client.publish("lindu/sensor/cmd/all", json.dumps(alarm_payload))
+    if is_critical:
+        # Aktuator (tutup valve gas & buka door lock) hanya aktif untuk gempa kritis (PGA >= 0.05g)
+        client.publish("lindu/actuator/cmd/all", json.dumps(alarm_payload))
     
     # Simpan ke database (Black Box)
     save_alert(alarm_payload)
+
+    # Tandai event sensor sebagai terkonfirmasi (confirmed)
+    try:
+        conn_conf = get_db_connection()
+        if conn_conf:
+            cur_conf = conn_conf.cursor()
+            cur_conf.execute("""
+                UPDATE tb_sensor_events 
+                SET is_confirmed = true 
+                WHERE time_event >= NOW() - INTERVAL '30 seconds'
+                  AND node_id IN (%s, %s);
+            """, (t1["node_id"], t2["node_id"]))
+            conn_conf.commit()
+            cur_conf.close()
+            release_db_connection(conn_conf)
+    except Exception as e:
+        print("[DB Confirm Event Error]", e)
     
     # Kosongkan buffer agar tidak spam alarm berkali-kali
     trigger_buffer.clear()
