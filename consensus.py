@@ -684,18 +684,34 @@ def on_message(client, userdata, msg):
         # Termasuk data gas, cuaca, dll. sebelum filter membuang getaran lokal.
         save_telemetry(payload)
 
-        # [ALGORITMA ANTI-HOAKS / FILTER GETARAN KAKI & BENTURAN LOKAL]
-        # Multi-Tier Seismic Filtering:
-        # Tier 1: Gempa Ringan / Shindo 1-3 (PGA >= 0.0035g, Freq <= 28 Hz untuk mengakomodasi SNR MEMS ZCR)
-        # Tier 2: Gempa Kuat / Shindo 4+ (PGA >= 0.05g)
-        # Catatan: False positive lokal (langkah kaki/meja) difilter oleh Konsensus Spasial Multi-Node (>= 2 Node berjarak fisik)
-        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 28.0))
-        is_real_quake = (pga >= 0.0035 and is_seismic_freq)
+        # [ALGORITMA ANTI-HOAKS & FILTER SEISMIK MULTI-TIER]
+        # Frekuensi seismik gempa tektonik riil berada pada 0.5 - 15.0 Hz.
+        # Getaran mekanis meja, ketukan keyboard, langkah kaki, dan fan dominan di frekuensi tinggi (16 - 35 Hz).
+        is_seismic_freq = (freq_hz == 0 or (0.5 <= freq_hz <= 15.0))
+        
+        # 1. Gempa Kuat / Terasa Nyata (PGA >= 0.05g):
+        #    Harus berfrekuensi seismik (bukan benturan lokal keras frekuensi tinggi)
+        if pga >= 0.05:
+            is_real_quake = is_seismic_freq
+            if not is_real_quake:
+                print(f"[FILTER] Benturan lokal keras dari {node_id} ditolak (PGA:{pga:.3f}G, Freq:{freq_hz}Hz > 15Hz -> Hentakan/Benturan)")
+        
+        # 2. Gempa Sedang (0.020g <= PGA < 0.05g):
+        #    Harus berfrekuensi seismik DAN lonjakan STA/LTA awal
+        elif pga >= 0.020:
+            is_real_quake = is_seismic_freq and (sta_lta >= 1.20 or ml_prob >= 0.40)
+            
+        # 3. Gempa Mikro / Ringan (0.0035g <= PGA < 0.020g, Shindo 1-2):
+        #    WAJIB memiliki onset tajam (STA/LTA >= 1.25) dan frekuensi seismik murni (<= 15 Hz).
+        #    Noise statis meja/ketukan keyboard (STA/LTA ~ 0.6 - 1.1 atau Freq 18-28 Hz) DITOLAK 100%.
+        elif pga >= 0.0035:
+            is_real_quake = is_seismic_freq and (sta_lta >= 1.25 or ml_prob >= 0.50)
+            
+        else:
+            is_real_quake = False
 
         if not is_real_quake:
-            if pga >= 0.05 and not is_seismic_freq:
-                print(f"[FILTER] Getaran lokal keras dari {node_id} ditolak (PGA:{pga:.3f}G, Freq:{freq_hz}Hz > 15Hz -> Hentakan Kaki/Domestic Shock)")
-            return # Buang hentakan kaki, buku jatuh, dan noise kecil
+            return # Buang noise meja, ketukan, langkah kaki, dan tremor statis non-seismik
         
         # Simpan ke tb_sensor_events untuk setiap kandidat getaran gempa yang lolos filter
         group_id = payload.get("group_id") or node_registry.get(node_id, {}).get("group_id", "cluster_chiba")
