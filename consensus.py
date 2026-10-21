@@ -981,6 +981,17 @@ def run_consensus_logic():
             jarak_km = haversine_km(t1["lat"], t1["lon"], t2["lat"], t2["lon"])
             selisih_waktu = abs(t2["timestamp"] - t1["timestamp"])
             
+            # CEK TOTAL NODE TERDAFTAR DALAM GRUP INI:
+            total_registered = sum(1 for n in node_registry.values() if n.get("group_id") == gid)
+            max_pga = max(t1.get("pga", 0), t2.get("pga", 0))
+
+            # Jika grup memiliki >= 3 node terdaftar, 2 node HANYA diizinkan jika
+            # guncangan signifikan / kuat (PGA >= 0.05g) sebagai emergency fail-safe.
+            # Getaran mikro (< 0.05g) pada 2 node WAJIB ditolak karena terindikasi sentuhan meja lokal.
+            if total_registered >= 3 and max_pga < 0.05:
+                print(f"[-] PAIRWISE DITOLAK: Grup '{gid}' punya {total_registered} node, tapi hanya 2 bergetar lemah (PGA: {max_pga:.4f}G < 0.05G). Noise meja lokal diabaikan.")
+                continue
+
             is_valid = False
             if jarak_km < 0.1:
                 kecepatan = 6.0
@@ -1004,6 +1015,9 @@ def run_consensus_logic():
     all_nodes = list(unique_nodes.values())
     for t1, t2 in itertools.combinations(all_nodes, 2):
         if t1.get("group_id") == t2.get("group_id"):
+            continue
+        max_pga = max(t1.get("pga", 0), t2.get("pga", 0))
+        if max_pga < 0.05:
             continue
         jarak_km = haversine_km(t1["lat"], t1["lon"], t2["lat"], t2["lon"])
         selisih_waktu = abs(t2["timestamp"] - t1["timestamp"])
