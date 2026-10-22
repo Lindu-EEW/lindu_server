@@ -19,6 +19,7 @@ TOPIC_EXTERNAL  = "lindu/external/alert"
 TOPIC_ALARM     = "lindu/actuator/cmd/all"
 TOPIC_LOG       = "lindu/sensor/+/log"
 TOPIC_OFFLINE   = "lindu/sensor/+/offline_events"
+TOPIC_ACTUATOR  = "lindu/sensor/+/actuator"
 
 server_start_time = time.time()
 
@@ -195,12 +196,21 @@ def init_db():
                 message TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS actuator_log (
+                time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                node_id VARCHAR(50) NOT NULL,
+                actuator VARCHAR(32) NOT NULL,
+                state VARCHAR(32) NOT NULL,
+                reason VARCHAR(64)
+            );
+
             -- Index performa tinggi untuk Grafana dan TimescaleDB
             CREATE INDEX IF NOT EXISTS idx_sensor_telemetry_time_node ON sensor_telemetry (time DESC, node_id);
             CREATE INDEX IF NOT EXISTS idx_tb_sensor_telemetry_ts_node ON tb_sensor_telemetry (ts DESC, node_id);
             CREATE INDEX IF NOT EXISTS idx_sensor_status_time_node ON sensor_status (time DESC, node_id);
             CREATE INDEX IF NOT EXISTS idx_tb_node_logs_ts ON tb_node_logs (ts DESC);
             CREATE INDEX IF NOT EXISTS idx_tb_server_health_ts ON tb_server_health (ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_actuator_log_time_node ON actuator_log (time DESC, node_id);
         """)
         print("[DB] Semua tabel dan index performa dipastikan ada.")
         
@@ -255,9 +265,11 @@ def release_db_connection(conn):
         db_pool.putconn(conn)
 
 # Buffer untuk continuous telemetry dan status ingestion (dipakai Grafana & Live Fleet)
+tb_telemetry_ingest_buffer = []
 telemetry_ingest_buffer = []
 status_ingest_buffer = []
 logs_ingest_buffer = []
+actuator_ingest_buffer = []
 ingest_lock = threading.Lock()
 
 _last_cpu_idle = 0.0
@@ -267,14 +279,35 @@ def db_ingest_writer_thread():
     global _last_cpu_idle, _last_cpu_total
     last_health_ts = 0
     while True:
-        time.sleep(1)
+        time.sleep(0.5)
         with ingest_lock:
+            local_tb_telemetry = tb_telemetry_ingest_buffer[:]
             local_telemetry = telemetry_ingest_buffer[:]
             local_status = status_ingest_buffer[:]
             local_logs = logs_ingest_buffer[:]
+            local_actuator = actuator_ingest_buffer[:]
+            tb_telemetry_ingest_buffer.clear()
             telemetry_ingest_buffer.clear()
             status_ingest_buffer.clear()
             logs_ingest_buffer.clear()
+            actuator_ingest_buffer.clear()
+
+        if local_tb_telemetry:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    execute_values(cur, """
+                        INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
+                        VALUES %s
+                    """, local_tb_telemetry)
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[Ingest TB Telemetry Error] {e}")
+                    conn.rollback()
+                finally:
+                    release_db_connection(conn)
 
         if local_telemetry:
             conn = get_db_connection()
@@ -323,6 +356,23 @@ def db_ingest_writer_thread():
                     cur.close()
                 except Exception as e:
                     print(f"[Ingest Logs Error] {e}")
+                    conn.rollback()
+                finally:
+                    release_db_connection(conn)
+
+        if local_actuator:
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cur = conn.cursor()
+                    execute_values(cur, """
+                        INSERT INTO actuator_log (time, node_id, actuator, state, reason)
+                        VALUES %s
+                    """, local_actuator)
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[Ingest Actuator Error] {e}")
                     conn.rollback()
                 finally:
                     release_db_connection(conn)
@@ -390,68 +440,39 @@ def db_ingest_writer_thread():
 threading.Thread(target=db_ingest_writer_thread, daemon=True).start()
 
 def save_telemetry(payload):
-    """Simpan setiap pesan telemetri streaming ke database untuk analisis post-event."""
-    conn = get_db_connection()
-    if not conn:
-        return
+    """Simpan setiap pesan telemetri streaming ke buffer batch database untuk performa tinggi."""
     try:
-        cur = conn.cursor()
-        
-        # Konversi Unix Epoch ke TIMESTAMPTZ secara aman
         ml_prob = float(payload.get("ml_prob", 0.0) or 0.0)
         ml_agree = bool(payload.get("ml_agree", True))
         ts_value = payload.get("ts", 0)
-        if ts_value and ts_value > 1000000:
-            cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
-                VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """, (
-                ts_value,
-                payload.get("node_id"),
-                payload.get("pga", 0),
-                payload.get("sta_lta", 0),
-                payload.get("freq_hz", 0),
-                payload.get("ax", 0),
-                payload.get("ay", 0),
-                payload.get("az", 0),
-                payload.get("lat", 0),
-                payload.get("lon", 0),
-                payload.get("uptime", 0),
-                payload.get("gas_raw", 0),
-                payload.get("gas_alert", False),
-                payload.get("door_status", "UNKNOWN"),
-                payload.get("valve_status", "UNKNOWN"),
-                ml_prob,
-                ml_agree
-            ))
+        if ts_value and float(ts_value) > 1000000:
+            row_time = datetime.fromtimestamp(float(ts_value), tz=timezone.utc)
         else:
-            cur.execute("""
-                INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
-                VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
-            """, (
-                payload.get("node_id"),
-                payload.get("pga", 0),
-                payload.get("sta_lta", 0),
-                payload.get("freq_hz", 0),
-                payload.get("ax", 0),
-                payload.get("ay", 0),
-                payload.get("az", 0),
-                payload.get("lat", 0),
-                payload.get("lon", 0),
-                payload.get("uptime", 0),
-                payload.get("gas_raw", 0),
-                payload.get("gas_alert", False),
-                payload.get("door_status", "UNKNOWN"),
-                payload.get("valve_status", "UNKNOWN"),
-                ml_prob,
-                ml_agree
-            ))
-        conn.commit()
-        cur.close()
+            row_time = datetime.now(timezone.utc)
+
+        row = (
+            row_time,
+            payload.get("node_id"),
+            float(payload.get("pga", 0.0) or 0.0),
+            float(payload.get("sta_lta", 0.0) or 0.0),
+            int(payload.get("freq_hz", 0) or 0),
+            float(payload.get("ax", 0.0) or 0.0),
+            float(payload.get("ay", 0.0) or 0.0),
+            float(payload.get("az", 0.0) or 0.0),
+            float(payload.get("lat", 0.0) or 0.0),
+            float(payload.get("lon", 0.0) or 0.0),
+            int(payload.get("uptime", 0) or 0),
+            payload.get("gas_raw"),
+            bool(payload.get("gas_alert", False)),
+            str(payload.get("door_status", "UNKNOWN")),
+            str(payload.get("valve_status", "UNKNOWN")),
+            ml_prob,
+            ml_agree
+        )
+        with ingest_lock:
+            tb_telemetry_ingest_buffer.append(row)
     except Exception as e:
-        print(f"[DB Telemetry Error] {e}")
-    finally:
-        release_db_connection(conn)
+        print(f"[Save Telemetry Buffer Error] {e}")
 
 def save_alert(alarm_payload):
     """Simpan riwayat alarm ke database (Black Box)."""
@@ -504,8 +525,8 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 def on_connect(client, userdata, flags, rc):
     print(f"[SERVER] Terhubung ke MQTT Broker dengan kode {rc}")
-    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0), (TOPIC_LOG, 0), (TOPIC_OFFLINE, 0)])
-    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}, {TOPIC_OFFLINE}...")
+    client.subscribe([(TOPIC_STATUS, 0), (TOPIC_EVENT, 0), (TOPIC_TELEMETRY, 0), (TOPIC_EXTERNAL, 0), (TOPIC_LOG, 0), (TOPIC_OFFLINE, 0), (TOPIC_ACTUATOR, 0)])
+    print(f"[SERVER] Listening to {TOPIC_STATUS}, {TOPIC_EVENT}, {TOPIC_TELEMETRY}, {TOPIC_LOG}, {TOPIC_OFFLINE}, {TOPIC_ACTUATOR}...")
 
 def on_message(client, userdata, msg):
     payload = None
@@ -521,6 +542,22 @@ def on_message(client, userdata, msg):
         if node_id and message:
             with ingest_lock:
                 logs_ingest_buffer.append((datetime.now(timezone.utc), node_id, str(message)))
+        return
+
+    # 1.1 ACTUATOR EVENT LOG (Perubahan state valve, door, buzzer, led)
+    if "/actuator" in msg.topic:
+        node_id = (payload.get("node_id") if isinstance(payload, dict) else None) or msg.topic.split('/')[2]
+        actuator = payload.get("actuator") if isinstance(payload, dict) else None
+        state = payload.get("state") if isinstance(payload, dict) else None
+        reason = (payload.get("reason", "") if isinstance(payload, dict) else "") or ""
+        ts_val = payload.get("ts") if isinstance(payload, dict) else None
+        if ts_val and float(ts_val) > 1000000:
+            act_time = datetime.fromtimestamp(float(ts_val), tz=timezone.utc)
+        else:
+            act_time = datetime.now(timezone.utc)
+        if node_id and actuator and state:
+            with ingest_lock:
+                actuator_ingest_buffer.append((act_time, node_id, actuator, state, reason))
         return
 
     if not isinstance(payload, dict):
