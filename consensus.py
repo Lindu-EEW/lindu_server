@@ -638,10 +638,12 @@ def on_message(client, userdata, msg):
         ts_val = payload.get("ts", time.time())
         uptime_ms = payload.get("uptime", 0)
 
-        # Simpan ke tb_sensor_telemetry
+        group_id = node_registry.get(node_id, {}).get("group_id", "cluster_chiba")
+        # Simpan ke tb_sensor_telemetry dengan timestamp asli historis
         offline_payload = {
             "node_id": node_id,
             "ts": ts_val,
+            "is_offline_sync": True,
             "pga": pga,
             "sta_lta": sta_lta,
             "freq_hz": freq_hz,
@@ -649,9 +651,12 @@ def on_message(client, userdata, msg):
             "ax": ax,
             "ay": ay,
             "az": az,
+            "lat": node_registry.get(node_id, {}).get("lat", 0.0),
+            "lon": node_registry.get(node_id, {}).get("lon", 0.0),
             "uptime_ms": uptime_ms,
             "ml_prob": ml_prob,
             "ml_agree": ml_agree,
+            "vibe_class": "GEMPA_BUMI" if (pga >= 0.0080 or is_earthquake) else "AMBIENT_TENANG",
             "valve_status": "OFFLINE_RECORD",
             "door_status": "OFFLINE_RECORD"
         }
@@ -669,9 +674,9 @@ def on_message(client, userdata, msg):
                 try:
                     cur = conn.cursor()
                     cur.execute("""
-                        INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, is_confirmed)
-                        VALUES (to_timestamp(%s), %s, %s, %s, %s, true);
-                    """, (ts_val if ts_val > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz))
+                        INSERT INTO tb_sensor_events (time_event, node_id, pga, sta_lta, freq_hz, group_id, is_confirmed)
+                        VALUES (to_timestamp(%s), %s, %s, %s, %s, %s, true);
+                    """, (ts_val if ts_val > 1000000 else time.time(), node_id, pga, sta_lta, freq_hz, group_id))
                     conn.commit()
                     cur.close()
                 except Exception as e:
