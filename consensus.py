@@ -444,6 +444,7 @@ def save_telemetry(payload):
     try:
         ml_prob = float(payload.get("ml_prob", 0.0) or 0.0)
         ml_agree = bool(payload.get("ml_agree", True))
+        ts_value = payload.get("ts")
         # Gunakan server arrival time dengan presisi milidetik asli untuk live streaming
         # agar 10 sampel per detik memiliki jeda ~100ms terpisah, bukan bertumpuk di .000 yang sama
         if payload.get("is_offline_sync") and ts_value and float(ts_value) > 1000000:
@@ -766,11 +767,11 @@ def on_message(client, userdata, msg):
         elif pga >= 0.020:
             is_real_quake = is_seismic_freq and (sta_lta >= 1.20 or ml_prob >= 0.40)
             
-        # 3. Gempa Mikro / Ringan (0.0035g <= PGA < 0.020g, Shindo 1-2):
-        #    WAJIB memiliki onset tajam (STA/LTA >= 1.25) dan frekuensi seismik murni (<= 15 Hz).
-        #    Noise statis meja/ketukan keyboard (STA/LTA ~ 0.6 - 1.1 atau Freq 18-28 Hz) DITOLAK 100%.
-        elif pga >= 0.0035:
-            is_real_quake = is_seismic_freq and (sta_lta >= 1.25 or ml_prob >= 0.50)
+        # 3. Gempa Mikro / Ringan (0.0070g <= PGA < 0.020g, Shindo 1-2):
+        #    WAJIB memiliki onset tajam (STA/LTA >= 1.50) atau konfirmasi TinyML (>= 0.50) dan frekuensi seismik murni (<= 15 Hz).
+        #    Noise statis meja/ketukan keyboard (< 0.0070g atau STA/LTA ~ 0.8 - 1.3) DITOLAK 100%.
+        elif pga >= 0.0070:
+            is_real_quake = is_seismic_freq and (sta_lta >= 1.50 or ml_prob >= 0.50)
             
         else:
             is_real_quake = False
@@ -1221,6 +1222,7 @@ def get_metrics():
             SELECT DISTINCT ON (node_id) 
                 node_id, time, status, fw_version, ota_status, latency_ms, sensor_ok 
             FROM sensor_status 
+            WHERE time >= NOW() - INTERVAL '15 minutes'
             ORDER BY node_id, time DESC;
         """)
         rows = cur.fetchall()
