@@ -153,6 +153,8 @@ def init_db():
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS ml_agree BOOLEAN DEFAULT TRUE;")
         cur.execute("ALTER TABLE sensor_telemetry ADD COLUMN IF NOT EXISTS ml_prob DOUBLE PRECISION DEFAULT 0.0;")
         cur.execute("ALTER TABLE sensor_telemetry ADD COLUMN IF NOT EXISTS ml_agree BOOLEAN DEFAULT TRUE;")
+        cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS vibe_class VARCHAR(32) DEFAULT 'AMBIENT_TENANG';")
+        cur.execute("ALTER TABLE sensor_telemetry ADD COLUMN IF NOT EXISTS vibe_class VARCHAR(32) DEFAULT 'AMBIENT_TENANG';")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sensor_telemetry (
                 time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -298,7 +300,7 @@ def db_ingest_writer_thread():
                 try:
                     cur = conn.cursor()
                     execute_values(cur, """
-                        INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree)
+                        INSERT INTO tb_sensor_telemetry (ts, node_id, pga, sta_lta, freq_hz, ax, ay, az, lat, lon, uptime_ms, gas_raw, gas_alert, door_status, valve_status, ml_prob, ml_agree, vibe_class)
                         VALUES %s
                     """, local_tb_telemetry)
                     conn.commit()
@@ -315,7 +317,7 @@ def db_ingest_writer_thread():
                 try:
                     cur = conn.cursor()
                     execute_values(cur, """
-                        INSERT INTO sensor_telemetry (time, node_id, pga, rms, accel_x, accel_y, accel_z, temperature, pressure, humidity, latency_ms, valve_status, gas_raw, gas_alert, ml_prob, ml_agree)
+                        INSERT INTO sensor_telemetry (time, node_id, pga, rms, accel_x, accel_y, accel_z, temperature, pressure, humidity, latency_ms, valve_status, gas_raw, gas_alert, ml_prob, ml_agree, vibe_class)
                         VALUES %s
                     """, local_telemetry)
                     conn.commit()
@@ -452,6 +454,7 @@ def save_telemetry(payload):
         else:
             row_time = datetime.now(timezone.utc)
 
+        vibe_class = str(payload.get("vibe_class") or "AMBIENT_TENANG")
         row = (
             row_time,
             payload.get("node_id"),
@@ -469,7 +472,8 @@ def save_telemetry(payload):
             str(payload.get("door_status", "UNKNOWN")),
             str(payload.get("valve_status", "UNKNOWN")),
             ml_prob,
-            ml_agree
+            ml_agree,
+            vibe_class
         )
         with ingest_lock:
             tb_telemetry_ingest_buffer.append(row)
@@ -741,10 +745,13 @@ def on_message(client, userdata, msg):
         payload["ml_prob"] = ml_prob
         payload["ml_agree"] = ml_agree
 
+        vibe_class = str(payload.get("vibe_class") or "AMBIENT_TENANG")
+        payload["vibe_class"] = vibe_class
+
         # Ingest semua telemetri ke sensor_telemetry untuk Grafana real-time monitor
         with ingest_lock:
             telemetry_ingest_buffer.append((
-                datetime.now(timezone.utc), node_id, pga, rms, ax, ay, az, temp, pres, hum, latency_ms, valve, gas_raw, gas_alert, ml_prob, ml_agree
+                datetime.now(timezone.utc), node_id, pga, rms, ax, ay, az, temp, pres, hum, latency_ms, valve, gas_raw, gas_alert, ml_prob, ml_agree, vibe_class
             ))
         # Simpan SETIAP pesan telemetri ke database (rekaman detik-per-detik tb_sensor_telemetry)
         # Termasuk data gas, cuaca, dll. sebelum filter membuang getaran lokal.
