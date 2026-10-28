@@ -679,8 +679,28 @@ def on_message(client, userdata, msg):
     # 3. EVENT / TELEMETRI (Ada Getaran dari Node)
     elif "/telemetry" in msg.topic:
         node_id = payload.get("node_id") or msg.topic.split('/')[2]
-        pga = payload.get("pga", 0.0)
-        sta_lta = payload.get("sta_lta", 0.0)
+        
+        # [DATA QUALITY GUARD] Validasi & Sanitasi Data Sensor
+        try:
+            pga = float(payload.get("pga", 0.0) or 0.0)
+            if math.isnan(pga) or math.isinf(pga) or pga < 0.0:
+                pga = 0.0
+            elif pga > 3.0:
+                pga = 3.0
+        except (ValueError, TypeError):
+            pga = 0.0
+        payload["pga"] = pga
+
+        try:
+            sta_lta = float(payload.get("sta_lta", 1.0) or 1.0)
+            if math.isnan(sta_lta) or math.isinf(sta_lta) or sta_lta < 0.0:
+                sta_lta = 1.0
+            elif sta_lta > 50.0:
+                sta_lta = 50.0
+        except (ValueError, TypeError):
+            sta_lta = 1.0
+        payload["sta_lta"] = sta_lta
+
         rms = payload.get("rms", sta_lta)
         ax = payload.get("ax", payload.get("dyn_x", 0.0))
         ay = payload.get("ay", payload.get("dyn_y", 0.0))
@@ -691,8 +711,17 @@ def on_message(client, userdata, msg):
         valve = payload.get("valve_status", "UNKNOWN")
         gas_raw = payload.get("gas_raw")
         gas_alert = payload.get("gas_alert")
+        
         sent_ts = payload.get("ts", payload.get("timestamp"))
-        latency_ms = (time.time() - sent_ts) * 1000.0 if sent_ts else payload.get("latency_ms", 0.0)
+        try:
+            sent_ts = float(sent_ts)
+            now_server = time.time()
+            if sent_ts < (now_server - 86400) or sent_ts > (now_server + 300):
+                sent_ts = now_server
+        except (ValueError, TypeError):
+            sent_ts = time.time()
+        payload["ts"] = sent_ts
+        latency_ms = (time.time() - sent_ts) * 1000.0
 
         freq_hz = payload.get("freq_hz", 0)
 
