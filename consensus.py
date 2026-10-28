@@ -52,8 +52,8 @@ def predict_tinyml(pga, sta_lta, freq_hz, rms, duration_s=1.0, p_to_s=0.5):
     Evaluates seismic event probability using embedded TinyML model.
     Menghitung probabilitas gempa secara real-time (0.00 - 1.00).
     """
-    if pga < 0.02:
-        return round(0.01 + (pga / 0.02) * 0.02, 3)
+    if pga < 0.0080:
+        return round(0.01 + (pga / 0.0080) * 0.02, 3)
     effective_freq = freq_hz if freq_hz > 0 else (2.5 if pga >= 0.12 else 18.0)
     feats = [pga, sta_lta, effective_freq, rms, duration_s, p_to_s]
     z = ML_BIAS
@@ -444,8 +444,9 @@ def save_telemetry(payload):
     try:
         ml_prob = float(payload.get("ml_prob", 0.0) or 0.0)
         ml_agree = bool(payload.get("ml_agree", True))
-        ts_value = payload.get("ts", 0)
-        if ts_value and float(ts_value) > 1000000:
+        # Gunakan server arrival time dengan presisi milidetik asli untuk live streaming
+        # agar 10 sampel per detik memiliki jeda ~100ms terpisah, bukan bertumpuk di .000 yang sama
+        if payload.get("is_offline_sync") and ts_value and float(ts_value) > 1000000:
             row_time = datetime.fromtimestamp(float(ts_value), tz=timezone.utc)
         else:
             row_time = datetime.now(timezone.utc)
