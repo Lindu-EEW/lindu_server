@@ -878,13 +878,16 @@ def on_message(client, userdata, msg):
                     refined_lat = sum_lat / sum_pga
                     refined_lon = sum_lon / sum_pga
                     
-                    # Refine Magnitude using absolute Max PGA across all reporting nodes
+                    # Refine Magnitude using absolute Max PGA across all reporting nodes (Skala Seismik Kontinu)
                     abs_max_pga = max(active_quake["nodes_pga"].values())
-                    refined_mag = 5.0 + 1.5 * math.log10(abs_max_pga / 0.1) if abs_max_pga >= 0.1 else 5.0
-                    refined_mag = max(5.0, min(refined_mag, 9.9))
-                    refined_radius = 10 ** (0.5 * refined_mag - 1.0)
+                    safe_pga = max(0.001, abs_max_pga)
+                    refined_mag = round(4.0 + 1.5 * math.log10(safe_pga / 0.008), 1)
+                    refined_mag = max(2.0, min(9.5, refined_mag))
+                    refined_radius = round(10 ** (0.5 * refined_mag - 1.0), 1)
                     
-                    # Publish Update
+                    # Tentukan tingkat keparahan yang sesuai dengan PGA puncak aktual
+                    is_critical = (abs_max_pga >= 0.08)
+                    alarm_level = "CRITICAL" if is_critical else "ADVISORY"
                     
                     t_nodes = []
                     for nid, max_p in active_quake["nodes_pga"].items():
@@ -893,17 +896,20 @@ def on_message(client, userdata, msg):
                             "id": nid, "lat": c_lat, "lon": c_lon, "pga": round(max_p, 3)
                         })
                     
+                    node_summary = ", ".join([f"{n['id']} ({n['pga']:.3f}G)" for n in t_nodes])
+                    refine_desc = f"{'🚨 Peringatan Darurat Gempa Kuat!' if is_critical else 'ℹ️ Gempa Terdeteksi (Advisory)'} [TRI-NODE QUORUM Grup {active_quake['group_id']}] {len(t_nodes)} sensor aktif ({node_summary}) | Puncak PGA {abs_max_pga:.3f}G, M{refined_mag:.1f}."
+
                     update_payload = {
                         "triggering_nodes": t_nodes,
-
                         "cmd": "ALARM_UPDATE",
+                        "level": alarm_level,
                         "epicenter_lat": refined_lat,
                         "epicenter_lon": refined_lon,
                         "magnitude": round(refined_mag, 1),
                         "radius_km": round(refined_radius, 1),
                         "shift_km": round(haversine_km(active_quake["initial_lat"], active_quake["initial_lon"], refined_lat, refined_lon), 2),
                         "telemetry_count": active_quake["telemetry_count"],
-                        "desc": f"📡 Pemurnian Episentrum Live! Mengolah data dari {len(active_quake['nodes_pga'])} sensor aktif. Pusat energi terkoreksi menuju titik guncangan maksimum (PGA {abs_max_pga:.2f}G)."
+                        "desc": refine_desc
                     }
                     mqtt_client.publish(TOPIC_ALARM, json.dumps(update_payload))
                     mqtt_client.publish("lindu/actuator/cmd/all", json.dumps(update_payload))
@@ -1065,6 +1071,15 @@ def run_consensus_logic():
             max_jarak = max(haversine_km(n1["lat"], n1["lon"], n2["lat"], n2["lon"]) 
                             for n1, n2 in itertools.combinations(g_nodes, 2)) if len(g_nodes) > 1 else 0.1
             
+            # PROTEKSI CO-LOCATED (ANTI-FALSE-ALARM GOYANGAN MEJA):
+            # Jika semua node berada di meja/lokasi yang sama persis (jarak < 0.1 km / 100 meter):
+            # Goyangan meja manual atau sentuhan saat uji coba dapat mengguncang seluruh node serentak.
+            # Abaikan jika PGA puncak masih kecil (< 0.05g) agar tidak memicu alarm palsu.
+            max_pga = max(n.get("pga", 0.0) for n in g_nodes)
+            if max_jarak < 0.1 and max_pga < 0.05:
+                print(f"[-] KONSENSUS DITOLAK (ANTI-HOAX MEJA): {len(g_nodes)} node di meja/lokasi sama ({max_jarak*1000:.0f}m) bergetar ringan (Max PGA: {max_pga:.3f}G < 0.05G). Terindikasi goyangan meja/uji coba.")
+                continue
+
             kecepatan = max_jarak / selisih_waktu if selisih_waktu > 0.05 else 6.0
             print(f"\n[+] KONSENSUS GRUP '{gid}' TERCAPAI! {len(g_nodes)}/{total_registered} Node serentak bergetar (Syarat Quorum: {required_quorum} Node)!")
             print(f"    Nodes: {[n['node_id'] for n in g_nodes]} | Δt: {selisih_waktu:.2f}s | Max Dist: {max_jarak:.2f} km")
