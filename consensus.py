@@ -144,6 +144,7 @@ def init_db():
         cur.execute("ALTER TABLE tb_system_alerts ADD COLUMN IF NOT EXISTS triggering_nodes JSONB;")
         cur.execute("ALTER TABLE tb_system_alerts ADD COLUMN IF NOT EXISTS seismic_details JSONB;")
         
+        cur.execute("ALTER TABLE tb_sensor_events ADD COLUMN IF NOT EXISTS group_id VARCHAR(64);")
         cur.execute("ALTER TABLE tb_nodes ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ DEFAULT NOW();")
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS gas_raw INTEGER;")
         cur.execute("ALTER TABLE tb_sensor_telemetry ADD COLUMN IF NOT EXISTS gas_alert BOOLEAN;")
